@@ -62,6 +62,16 @@ class VoiceAnalyzer:
         self.thread = threading.Thread(target=self._record_loop, daemon=True)
         self.thread.start()
 
+    def stop_monitoring(self):
+        """Stop live mic capture without scoring (used on DISARM)."""
+        if not VOICE_AVAILABLE:
+            return
+        self.is_recording = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        with self.lock:
+            self.buffer = []
+
     def stop_recording(self) -> VoiceResult:
         if not VOICE_AVAILABLE:
             return VoiceResult_empty()

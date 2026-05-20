@@ -26,10 +26,12 @@ except Exception as e:
     ANALYZER_OK = False
 
 try:
-    from scoring import LieScorer
+    from scoring import LieScorer, VERDICT_THRESHOLD, BASE_SCORE
     SCORER_OK = True
 except Exception:
     SCORER_OK = False
+    VERDICT_THRESHOLD = 50
+    BASE_SCORE = 15
 
 try:
     from ai_analyst import AIAnalyst, AI_AVAILABLE
@@ -211,8 +213,21 @@ def _arm_feature(feature_key: str):
         if not _face.is_tracking:
             _face.start()
     if feature_key == "microphone_sensor" and VOICE_AVAILABLE and _voice:
-        # Manual arm intent; recording still starts per question.
-        pass
+        if not _voice.is_recording:
+            _voice.start_recording()
+
+def _disarm_feature(feature_key: str):
+    if feature_key == "camera_feed" and FACE_AVAILABLE and _face:
+        if _face.is_tracking:
+            _face.stop()
+    if feature_key == "microphone_sensor" and VOICE_AVAILABLE and _voice:
+        _voice.stop_monitoring()
+
+def _disarm_all_manual_peripherals():
+    for key in ("camera_feed", "microphone_sensor"):
+        with _feature_lock:
+            _feature_state[key]["armed"] = False
+        _disarm_feature(key)
 
 _load_baselines()
 
@@ -341,26 +356,42 @@ def _sensor_loop():
                 pass
         time.sleep(0.1)
 
+def _analysis_from_typing_metrics(answer_text: str, metrics: dict) -> AnalysisResult:
+    """Build AnalysisResult from browser-captured keystroke timing (no random values)."""
+    words = answer_text.split()
+    word_count = len(words)
+    cognitive_delay = float(metrics.get('cognitive_delay', 0) or 0)
+    duration = float(metrics.get('duration', 0) or 0)
+    wpm = float(metrics.get('wpm', 0) or 0)
+    burst_volatility = float(metrics.get('burst_volatility', 0) or 0)
+    backspace_count = int(metrics.get('backspace_count', 0) or 0)
+
+    if cognitive_delay <= 0 and duration > 0:
+        cognitive_delay = min(30.0, max(0.5, duration * 0.15))
+    if duration <= 0 and word_count > 0:
+        duration = max(1.0, word_count * 0.45)
+    if wpm <= 0 and duration > 0 and word_count > 0:
+        wpm = round(word_count / (duration / 60.0), 1)
+    if burst_volatility <= 0 and word_count > 1:
+        burst_volatility = 0.35
+
+    return AnalysisResult(
+        answer=answer_text,
+        word_count=word_count,
+        cognitive_delay=round(max(0.0, cognitive_delay), 3),
+        wpm=round(max(0.0, min(200.0, wpm)), 1),
+        burst_volatility=round(max(0.0, burst_volatility), 4),
+        backspace_count=backspace_count,
+        duration=round(max(0.5, duration), 3),
+    )
+
 # \u2500\u2500 Answer processing (runs in background thread) \u2500\u2500\u2500\u2500\u2500
-def _process_answer(answer_text, question_text):
+def _process_answer(answer_text, question_text, typing_metrics=None):
     with _state_lock:
         _state['phase'] = 'analyzing'
 
     try:
-        # Build fake AnalysisResult from web input
-        # (No keystroke hooks in browser \u2014 we use timing from JS)
-        words = answer_text.split()
-        word_count = len(words)
-        
-        result = AnalysisResult(
-            answer=answer_text,
-            word_count=word_count,
-            cognitive_delay=random.gauss(4.5, 1.5),  # simulated for web
-            wpm=max(10, min(120, word_count * 4)),
-            burst_volatility=random.gauss(0.6, 0.15),
-            backspace_count=0,
-            duration=max(5.0, word_count * 0.6)
-        )
+        result = _analysis_from_typing_metrics(answer_text, typing_metrics or {})
 
         # Voice
         if _feature_enabled("microphone_sensor") and _feature_armed("microphone_sensor") and VOICE_AVAILABLE and _voice:
@@ -400,8 +431,9 @@ def _process_answer(answer_text, question_text):
                 result, ai_result, voice_result, face_stats, contradiction
             )
         else:
-            score = {"lie_probability": 50, "verdict": "INCONCLUSIVE",
-                     "confidence": "LOW", "flags": [], "source_breakdown": {}}
+            score = {"lie_probability": BASE_SCORE if SCORER_OK else 15,
+                     "verdict": "TRUTHFUL", "confidence": "LOW",
+                     "flags": ["SCORER MODULE OFFLINE"], "source_breakdown": {}}
 
         score['question'] = question_text
         score['addon_signals'] = {}
@@ -428,7 +460,9 @@ def _process_answer(answer_text, question_text):
             score['addon_signals']['uncertainty'] = round(uncertainty, 3)
             score['lie_probability'] = int(round((0.65 * score['lie_probability']) + (0.35 * fused)))
             if uncertainty > 0.55:
-                score['flags'] = list(score.get('flags', [])) + ["HIGH TEMPORAL UNCERTAINTY"]
+                score['flags'] = list(score.get('flags', [])) + [
+                    "TEMPORAL SPREAD ELEVATED — FUSION WEIGHT APPLIED"
+                ]
 
         if _feature_enabled("audio_forensics"):
             score['addon_signals']['audio_forensics'] = {
@@ -562,6 +596,7 @@ def on_connect():
         'can_start': _validate_feature_readiness()[0],
         'blocking': _validate_feature_readiness()[1],
     })
+    emit('peripheral_status', _peripheral_status_payload())
 
 @socketio.on('set_feature')
 def on_set_feature(data):
@@ -579,6 +614,12 @@ def on_set_feature(data):
             st['enabled'] = False
             st['armed'] = False
         elif action == 'arm':
+            if not st['enabled']:
+                emit('error_msg', {'msg': f'Enable {key} before arming.'})
+                return
+            if not st['available']:
+                emit('error_msg', {'msg': f'{key} is unavailable on this machine.'})
+                return
             st['armed'] = True
         elif action == 'disarm':
             st['armed'] = False
@@ -586,13 +627,32 @@ def on_set_feature(data):
             emit('error_msg', {'msg': f'Unknown action: {action}'})
             return
 
-    if action == 'arm':
-        try:
+    try:
+        if action == 'arm':
             _arm_feature(key)
-        except Exception:
-            pass
+        elif action in ('disarm', 'disable'):
+            _disarm_feature(key)
+    except Exception as e:
+        emit('error_msg', {'msg': f'Peripheral {action} failed: {e}'})
 
+    emit('peripheral_status', _peripheral_status_payload())
     _broadcast_feature_matrix()
+
+def _peripheral_status_payload():
+    cam_on = bool(FACE_AVAILABLE and _face and _face.is_tracking)
+    mic_on = bool(VOICE_AVAILABLE and _voice and _voice.is_recording)
+    return {
+        "camera": {
+            "armed": _feature_armed("camera_feed"),
+            "enabled": _feature_enabled("camera_feed"),
+            "active": cam_on,
+        },
+        "microphone": {
+            "armed": _feature_armed("microphone_sensor"),
+            "enabled": _feature_enabled("microphone_sensor"),
+            "active": mic_on,
+        },
+    }
 
 @socketio.on('bulk_feature_action')
 def on_bulk_feature_action(data):
@@ -609,13 +669,10 @@ def on_bulk_feature_action(data):
             elif action == 'reset':
                 st['enabled'] = None
                 st['armed'] = False
-    if action == 'enable_all_available':
-        for key in _FEATURE_DEFS:
-            if _FEATURE_DEFS[key]["manual_arm"]:
-                continue
-            # non-manual features are considered armed by design
-            pass
+    if action in ('disable_all', 'reset'):
+        _disarm_all_manual_peripherals()
     _broadcast_feature_matrix()
+    emit('peripheral_status', _peripheral_status_payload())
 
 @socketio.on('request_feature_matrix')
 def on_request_feature_matrix(_data=None):
@@ -651,7 +708,12 @@ def on_start_session(data):
     if _feature_enabled("camera_feed") and _feature_armed("camera_feed") and FACE_AVAILABLE and _face:
         try: _face.start()
         except Exception: pass
-    q = _pick_question(QUESTION_BANK)
+
+    custom_q = str(data.get('custom_question', '') or '').strip()
+    if mode == 3 and custom_q:
+        q = custom_q
+    else:
+        q = _pick_question(QUESTION_BANK)
     with _state_lock:
         _state['current_question'] = q
     emit('new_question', {'question': q, 'number': _state['questions_asked'] + 1})
@@ -666,7 +728,10 @@ def on_submit_answer(data):
     if _feature_enabled("microphone_sensor") and _feature_armed("microphone_sensor") and VOICE_AVAILABLE and _voice:
         try: _voice.start_recording()
         except Exception: pass
-    t = threading.Thread(target=_process_answer, args=(answer, question), daemon=True)
+    metrics = data.get('typing_metrics') or {}
+    t = threading.Thread(
+        target=_process_answer, args=(answer, question, metrics), daemon=True
+    )
     t.start()
 
 @socketio.on('next_question')
@@ -760,12 +825,10 @@ def _generate_final_report():
     dec = sum(1 for h in history if h['score'].get('verdict') == 'DECEPTIVE')
     tru = sum(1 for h in history if h['score'].get('verdict') == 'TRUTHFUL')
 
-    if avg > 60 or dec > len(history) // 2:
+    if avg > VERDICT_THRESHOLD or dec > 0:
         overall = "SUBJECT FLAGGED"
-    elif avg < 35 and dec == 0:
-        overall = "SUBJECT CLEARED"
     else:
-        overall = "ANALYSIS INCONCLUSIVE"
+        overall = "SUBJECT CLEARED"
 
     baseline_note = None
     if _feature_enabled("subject_baseline"):

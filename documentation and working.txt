@@ -1,0 +1,393 @@
+================================================================================
+POLYTRUTH v5.0 — DOCUMENTATION AND WORKING
+================================================================================
+Project: lie-detector (POLYTRUTH Behavioral Interrogation System)
+Stack: Python (CLI + Flask/Socket.IO web GUI), optional Gemini AI, OpenCV, sounddevice
+Last updated: 2026-05-21
+
+This document explains how the system works end-to-end, all four modes, where the
+"dataset" comes from, how scores are calculated (without grey/inconclusive bands),
+how thresholds relate to published deception research, and how this project compares
+to prior work in the field.
+
+================================================================================
+1. SYSTEM ARCHITECTURE (HIGH LEVEL)
+================================================================================
+
+Two frontends share one backend logic family:
+
+  A) CLI — main.py → menu.py → session.py (+ Rich dashboard in ui.py)
+  B) Web — gui.py (Flask-Socket.IO) + gui_template.html (browser UI)
+
+Core pipeline for EVERY answered question:
+
+  1. Present question
+  2. Capture subject response (keystrokes + optional mic + optional camera)
+  3. Build AnalysisResult (timing/typing metrics)
+  4. Optional: voice stress metrics (VoiceAnalyzer)
+  5. Optional: face/gaze metrics (FaceTracker)
+  6. Optional: contradiction check vs prior answers (ContradictionEngine)
+  7. Optional: AI linguistic analysis (AIAnalyst / Gemini) — additive delta only
+  8. LieScorer.score_multimodal() → lie_probability 0–100 + flags + verdict
+  9. Store in session history; branch to next question or final report
+
+Verdict policy (binary, no grey zone):
+  - lie_probability <= 50  → TRUTHFUL
+  - lie_probability > 50   → DECEPTIVE
+
+Session overall label:
+  - SUBJECT CLEARED  if average lie score <= 50 AND zero DECEPTIVE answers
+  - SUBJECT FLAGGED  if average > 50 OR any DECEPTIVE answer
+
+================================================================================
+2. THE "DATASET" — WHERE QUESTIONS COME FROM (FOR YOUR TEACHER)
+================================================================================
+
+There is NO external CSV/JSON training dataset bundled with this project.
+
+Question content lives in: questions.py (hand-authored Python lists)
+
+  • QUESTION_BANK        — ~57 neutral/high-pressure forensic prompts
+  • FOLLOWUP_DECEPTIVE   — 15 escalation probes after a DECEPTIVE verdict
+  • FOLLOWUP_TRUTHFUL    — 15 empathy/consistency probes after TRUTHFUL verdict
+  • USED_QUESTIONS       — runtime set() to avoid repeats in one server process
+
+Origin of question text:
+  - Written for this project (interrogation-style open prompts)
+  - Thematically aligned with "unexpected questions" and cognitive-load interview
+    methods used in deception research (see Vrij et al., reaction-time studies)
+  - NOT scraped from a public lie-detection corpus; NOT ML-trained on labeled lies
+
+What IS measured as "data" during a session:
+  - Keystroke timing (delay, WPM, inter-key variance, backspaces)
+  - Lexical markers (hedges, distancing phrases, over-justification)
+  - Optional microphone amplitude statistics
+  - Optional face presence / movement variance / look-away count
+  - Rule-based contradiction hits across answers
+  - Optional Gemini JSON delta for language (if API key present)
+
+Important honesty statement for academic use:
+  This is a RULE-BASED + HEURISTIC demonstration system, not a validated forensic
+  instrument. Accuracy is NOT claimed to match laboratory polygraph or trained
+  human interviewers.
+
+================================================================================
+3. THE FOUR MODES — BEHAVIOR AND CALCULATION
+================================================================================
+
+All modes use the SAME scoring engine (LieScorer). Modes differ only in:
+  - how many questions run
+  - which question pool is selected
+  - (Friend Test) who supplies the question text
+
+------------------------------------------------------------------------------
+MODE 1 — HONESTY TEST (Full behavioral profiling)
+------------------------------------------------------------------------------
+CLI: 6 questions from QUESTION_BANK only
+Web: max 6 questions, QUESTION_BANK only
+
+Flow: linear series, no branching. Each answer scored independently; session
+report averages lie_probability and counts TRUTHFUL vs DECEPTIVE.
+
+Use case: baseline multi-question profile (closest to "series of questions").
+
+------------------------------------------------------------------------------
+MODE 2 — INTERROGATION (Adaptive branching)
+------------------------------------------------------------------------------
+CLI: 3 base questions from QUESTION_BANK; after EACH answer, if verdict is
+     DECEPTIVE → one question from FOLLOWUP_DECEPTIVE; if TRUTHFUL → one from
+     FOLLOWUP_TRUTHFUL (max 2 follow-ups total in CLI).
+
+Web: up to 5 questions. After each answer, next_question() picks pool:
+     - Default: QUESTION_BANK
+     - If adaptive_interrogation enabled and last verdict DECEPTIVE →
+       FOLLOWUP_DECEPTIVE
+     - If last verdict TRUTHFUL → FOLLOWUP_TRUTHFUL
+     - If temporal fusion uncertainty > 0.5 → stay on QUESTION_BANK
+
+Same scoring per answer; branching only changes the NEXT prompt.
+
+------------------------------------------------------------------------------
+MODE 3 — FRIEND TEST (Custom question, 2-player)
+------------------------------------------------------------------------------
+CLI: Operator types a custom question (unmonitored prompt); subject answers;
+     single scored response; full multimodal pipeline.
+
+Web: Browser prompt() collects custom_question; server uses that string instead
+     of QUESTION_BANK. Still requires 15-word minimum answer.
+
+Dataset angle: the "dataset" for this mode is USER-GENERATED text (one question
+per session), not from QUESTION_BANK. Scoring rules are identical to other modes.
+
+//how the fuck is this being calculated
+
+------------------------------------------------------------------------------
+MODE 4 — SINGLE QUESTION (Rapid baseline)
+------------------------------------------------------------------------------
+CLI/Web: exactly 1 question (from QUESTION_BANK unless Friend-style custom in
+future). One score → immediate final report.
+
+Counter "Q:" in header = questions_asked (incremented after each scored answer).
+Report TOTAL QUESTIONS = len(session_history).
+
+================================================================================
+4. SCORING — DETERMINISTIC RULES (NO RANDOM "HALLUCINATION")
+================================================================================
+
+File: scoring.py — class LieScorer
+
+Base score starts at 15 points. Points ADD for suspicious signals. Final score
+clamped to [0, 100]. Verdict = TRUTHFUL if <= 50 else DECEPTIVE.
+
+4.1 Keystroke / timing (AnalysisResult)
+---------------------------------------
+Signal                              Threshold           Points   Flag
+------------------------------------------------------------------
+Cognitive delay (pre-first-key)     > 6.0 sec           +25      Extended pre-response load
+                                    >= 4.0 sec          +15      Elevated fabrication latency
+                                    >= 2.0 sec          +5       Elevated response latency
+                                    < 1.0 sec           +5       Abnormally fast onset
+
+Words per minute (WPM)                > 80                +10      Rehearsed script velocity
+                                    0 < WPM < 15        +8       Motor hesitation
+
+Burst volatility (inter-key σ)      > 0.8               +20      Active story editing
+                                    > 0.5               +10      Moderate editing
+
+Backspace count                     > 8                 +15      Excessive correction
+                                    > 4                 +8       Self-censorship
+
+Word count                          < 20                +12      Evasive brevity
+
+Web GUI: timing comes from JavaScript keydown timestamps sent as typing_metrics
+(no random.gauss on server). CLI: real keyboard hooks or duration-derived fallback.
+
+4.2 Lexical rules (same answer text, lowercase scan)
+----------------------------------------------------
+Each hit on UNCERTAINTY_WORDS list: +6 per phrase (e.g. "maybe", "i think")
+Each hit on DISTANCING_PHRASES: +7 (e.g. "that person", "at that point")
+Over-justification (because/since/therefore count > 3): +10
+
+4.3 Multimodal add-ons (score_multimodal)
+-----------------------------------------
+  final = clamp( rule_score + ai_delta + voice_stress + face_score + contradiction )
+
+AI delta: clamped to [-15, +35] from Gemini JSON field ai_lie_score_delta.
+If AI offline: delta = 0, flag "AI ANALYSIS UNAVAILABLE — RULE ENGINE ACTIVE".
+
+Voice (voice_analyzer.py) — only when mic ARMED + enabled:
+  avg_amplitude > 0.4        → +10
+  variance > 0.15            → +8
+  silence_ratio < 0.3        → +7
+  peak > 0.8                 → +5
+  (cap stress_score at 30)
+
+Face (face_tracker.py) — only when camera ARMED + enabled:
+  look_away_count > 3        → +15
+  look_away_count > 1        → +8
+  position variance > 0.08   → +10
+  face not detected at snap → +5
+  (cap face_score at 25)
+
+Contradiction (contradiction_engine.py):
+  LOW +8, MEDIUM +18, HIGH +30 on detected rule hit (time conflict, denial reversal)
+
+Temporal fusion (web add-on): rolling mean of last N lie scores blended 65/35;
+does NOT create a third verdict — only adjusts numeric score and may add flag.
+
+4.4 Confidence
+--------------
+HIGH if >= 2 independent signal families contributed; else LOW.
+(No MEDIUM band — reduced ambiguity.)
+
+================================================================================
+5. THRESHOLDS vs PUBLISHED / "UNIVERSAL" METHODS
+================================================================================
+
+Research area: deception detection without traditional polygraph.
+
+5.1 Keystroke dynamics (what we implement)
+------------------------------------------
+Literature (EMNLP 2014; ACM chat deception; keystroke survey 2021):
+  - Lying increases cognitive load → longer pauses before and during typing.
+  - Deceptive writing shows more editing, higher pause variance, revision bursts.
+
+Our mapping:
+  - cognitive_delay tiers (2s / 4s / 6s) encode "pause before response"
+  - burst_volatility = std dev of inter-key intervals → editing under load
+  - backspace_count → self-correction / monitoring
+
+These are HEURISTICALLY inspired, not calibrated on a published corpus in-repo.
+
+5.2 Voice stress analysis (what we implement)
+---------------------------------------------
+Published VSA (e.g. Layered Voice Analysis evaluations): often near chance accuracy
+for binary lie/truth in controlled studies (~42–56% hit rates cited in reviews).
+
+Our approach: simple amplitude/variance/silence heuristics on the microphone
+stream — NOT full F0/jitter/MFCC ML models used in newer papers (~72–79% in some
+ML studies with MFCC features).
+
+Lesson for teacher: our voice layer is demonstrative; state-of-the-art uses
+learned features + large labeled datasets.
+
+5.3 Gaze / face (what we implement)
+-----------------------------------
+Meta-analyses: gaze aversion alone is a WEAK cue; pupil dilation and fixation
+patterns can show better signal in lab eye-tracking (e.g. ~74% in some setups).
+
+We use OpenCV Haar face box + movement variance + look-away count — a simplified
+proxy, not pupilometry. Literature warns against "liar looks away" stereotypes.
+
+5.4 Lexical/content analysis
+----------------------------
+Criteria-Based Content Analysis (CBCA) and Statement Validity Assessment use
+trained human coders — not automated hedge lists. Our lexical lists are
+transparent rules, not validated SVA/CBCA.
+
+5.5 Polygraph comparison
+------------------------
+Traditional polygraph: autonomic arousal (EDA, HR, respiration). We do NOT measure
+galvanic skin response for scoring (web "SC" waveform is cosmetic animation only).
+Biomarker bars (cortisol, pupil, etc.) in GUI are simulated visuals, not inputs
+to LieScorer unless tied to real sensors (they are not).
+
+BINARY 50% verdict threshold:
+  - Chosen for clarity in teaching/demo (single cut on 0–100 scale).
+  - Research studies often use classifier ROC optimal cuts per dataset — which
+    we do not have here.
+
+================================================================================
+6. PRIOR WORK — EXAMPLES AND COMPARISON TO POLYTRUTH
+================================================================================
+
+6.1 Keystroke / digital writing deception
+-----------------------------------------
+Example: "Keystroke Patterns as Prosody in Digital Writings" (EMNLP 2014)
+  - Uses pause, rate, revision as prosody analogs in deceptive reviews/essays.
+Similar: We compute cognitive_delay, WPM, burst_volatility, backspaces.
+Different: They trained classifiers on labeled deceptive/truthful text corpora;
+           we use fixed additive point rules and no ML training.
+
+Example: "Detecting Liars in Chats using Keystroke Dynamics" (ACM)
+  - Chat setting, keystroke features for deception.
+Similar: Real-time typing capture in web GUI.
+Different: They report model accuracy on their dataset; we do not claim accuracy.
+
+6.2 Reaction time / unexpected questions
+-----------------------------------------
+Example: Vrij et al., unexpected questions + reaction times (~90% in some RT paradigms)
+Similar: High-pressure unexpected questions in QUESTION_BANK.
+Different: We measure typing delay, not multiple-choice RT; question bank is static
+           strings, not an experimentally validated battery.
+
+6.3 Voice stress / acoustic deception
+-------------------------------------
+Example: LVA evaluations (stress in speech) — often chance-level in blind tests.
+Similar: Microphone stress_score from amplitude dynamics.
+Different: Commercial VSA uses proprietary features; we use coarse thresholds.
+
+Example: ML + MFCC / LSTM deception classifiers (recent papers ~72–79%)
+Different: We have no MFCC pipeline or trained neural model.
+
+6.4 Multimodal fusion (face + speech + text)
+----------------------------------------------
+Example: MDPI Applied Sciences — attention LSTM on gaze + speech.
+Similar: Multimodal score_multimodal fusion concept.
+Different: They learn fusion weights from data; we add fixed point contributions.
+
+6.5 AI / LLM forensic linguistics
+----------------------------------
+Example: Modern LLM deception analysis (emerging, not standardized in courts).
+Similar: Gemini returns ai_lie_score_delta + flags + technique label.
+Different: LLM output can be unstable; we clamp delta and fall back to rules if
+           API missing. Teacher should treat AI layer as experimental, not ground truth.
+
+6.6 Serious validated frameworks (contrast)
+--------------------------------------------
+  - CBCA / SVA (human-trained statement analysis)
+  - Controlled polygraph protocols (CQT etc.) — controversial legally
+  - Laboratory eye-tracking + pupilometry with trained classifiers
+
+POLYTRUTH is closest to: "explainable heuristic multimodal demo" for education,
+not a certified deception test.
+
+================================================================================
+7. PERIPHERALS — ARM / DISARM (FIXED BEHAVIOR)
+================================================================================
+
+Manual hardware features (web GUI add-on gate):
+
+  camera_feed:
+    ENABLE → allows arming
+    ARM    → FaceTracker.start() — opens webcam, live overlay, face scoring active
+    DISARM → FaceTracker.stop() — releases camera, scoring uses empty face stats
+    DISABLE → disarms + turns feature off
+
+  microphone_sensor:
+    ENABLE → allows arming
+    ARM    → VoiceAnalyzer.start_recording() — live buffer + waveform
+    DISARM → VoiceAnalyzer.stop_monitoring() — stops capture, clears buffer
+    DISABLE → disarms + off
+
+Scoring uses peripherals ONLY when: feature enabled AND armed AND hardware available.
+
+Sensor loop does NOT auto-start camera unless armed (prevents "armed but dead" lie).
+
+================================================================================
+8. WEB vs CLI DIFFERENCES (TRANSPARENCY)
+================================================================================
+
+  • CLI: real keyboard hooks (analyzer.py) when OS permits
+  • Web: browser typing_metrics JSON (deterministic)
+  • CLI Friend Test: operator types custom question in terminal
+  • Web Friend Test: browser prompt() → custom_question to server
+  • Interrogation branching logic differs slightly (see Section 3)
+  • Animated HR/RR/SC/biomarkers in web sidebar: cosmetic only, not scored
+
+================================================================================
+9. AI ROLE — WHAT IT DOES AND DOES NOT DO
+================================================================================
+
+When GEMINI_API_KEY is set (ai_analyst.py):
+  - Returns JSON: ai_lie_score_delta, linguistic_flags, profile note, technique tag
+  - Delta is bounded and ADDED to rule score
+  - Does NOT replace rule engine; if API fails → delta 0
+
+When AI offline:
+  - Scoring is 100% rules + sensors + contradictions
+  - Final profile text uses rule-based _build_behavioral_summary in CLI
+
+For "black and white" teaching: disable AI in add-on panel (DISABLE on ai_forensics)
+and rely purely on Section 4 thresholds.
+
+================================================================================
+10. FILE MAP (QUICK REFERENCE)
+================================================================================
+
+  main.py / menu.py          CLI entry and mode selection
+  session.py                 Four mode loops, report builder
+  questions.py               Question "dataset" (authored lists)
+  analyzer.py                Keystroke capture → AnalysisResult
+  scoring.py                 Lie probability + binary verdict
+  voice_analyzer.py          Microphone capture + stress points
+  face_tracker.py            Webcam face metrics
+  contradiction_engine.py    Cross-answer rule contradictions
+  ai_analyst.py              Optional Gemini overlay
+  gui.py                     Web server, state, Socket.IO, peripheral arm/disarm
+  gui_template.html          Browser UI and typing capture
+
+================================================================================
+11. RUNNING / RESTART AFTER CODE CHANGES
+================================================================================
+
+  pip install -r requirements.txt
+  py gui.py          → http://localhost:5000
+  py main.py         → terminal CLI
+
+After pulling fixes: restart gui.py (Ctrl+C, then py gui.py) so server loads new
+arm/disarm handlers and scoring constants.
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================

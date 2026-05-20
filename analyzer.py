@@ -165,8 +165,8 @@ class KeystrokeAnalyzer:
             variance = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
             burst_volatility = math.sqrt(variance)
         else:
-            # Fallback: gaussian random to keep scoring alive
-            burst_volatility = max(0.0, random.gauss(0.6, 0.15))
+            # No keystroke hooks: derive from typing duration (deterministic, not random)
+            burst_volatility = min(1.0, max(0.2, duration / max(1.0, word_count * 2)))
 
         return AnalysisResult(
             answer=answer,

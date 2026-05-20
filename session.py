@@ -104,17 +104,18 @@ def _build_behavioral_summary(scores: List[dict]) -> str:
         top_flag, freq = flag_cats.most_common(1)[0]
         flag_summary = f" Dominant behavioral marker: {top_flag} (appeared {freq}x)."
 
-    if avg > 60:
+    from scoring import VERDICT_THRESHOLD
+    if avg > VERDICT_THRESHOLD:
         profile = (
             f"Subject demonstrated elevated deception indicators throughout the session. "
             f"Average lie probability: {avg:.0f}%. "
             f"{dec_count} of {len(scores)} responses were classified DECEPTIVE.{flag_summary}"
         )
-    elif avg > 35:
+    elif avg > 50:
         profile = (
-            f"Subject showed mixed behavioral signals. "
+            f"Subject exceeded deception threshold. "
             f"Average lie probability: {avg:.0f}%. "
-            f"Pattern suggests selective disclosure or moderate cognitive load.{flag_summary}"
+            f"Classified DECEPTIVE on aggregate.{flag_summary}"
         )
     else:
         profile = (
@@ -146,12 +147,11 @@ def _build_report(scores: List[dict], mode_label: str = "") -> dict:
     tru = sum(1 for s in scores if s["verdict"] == "TRUTHFUL")
     inc = sum(1 for s in scores if s["verdict"] == "INCONCLUSIVE")
 
-    if avg > 60 or dec >= len(scores) // 2 + 1:
+    from scoring import VERDICT_THRESHOLD
+    if avg > VERDICT_THRESHOLD or dec > 0:
         overall = "SUBJECT FLAGGED"
-    elif avg < 35 and dec == 0:
-        overall = "SUBJECT CLEARED"
     else:
-        overall = "ANALYSIS INCONCLUSIVE"
+        overall = "SUBJECT CLEARED"
 
     # AI overwrite for profile if available
     ai_profile = _ai.generate_final_profile(

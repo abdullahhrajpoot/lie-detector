@@ -273,7 +273,7 @@
                     <div style="font-size: 12px; margin-bottom: 5px;" class="cyan">SYSTEM QUERY RECIEVED:</div>
                     <div class="q-box amber glow" id="q-text">Loading question...</div>
                     <div style="font-size: 12px; margin-bottom: 5px;" class="dim">MINIMUM 15 WORDS — SYSTEM MONITORS ALL INPUT</div>
-                    <textarea id="answer-input" placeholder=">> " onkeyup="updateWordCount()"></textarea>
+                    <textarea id="answer-input" placeholder=">> " onkeyup="updateWordCount()" onkeydown="onAnswerKeyDown(event)"></textarea>
                     <div style="display:flex; justify-content: space-between; margin-bottom: 10px;">
                         <span id="word-count" class="dim">WORDS: 0</span>
                         <span id="answer-warn" class="red"></span>
@@ -771,12 +771,15 @@
             latestFaceBox = f.box || null;
             faceCentered = !!f.centered;
             faceLockDistance = typeof f.distance === 'number' ? f.distance : 1.0;
-            if (facePresent) {
-                cameraHudEl.innerText = faceCentered
-                    ? "CAMERA LINK: TARGET LOCKED"
-                    : `CAMERA LINK: ALIGNING (${Math.max(0, Math.min(99, Math.floor(faceLockDistance * 100)))}%)`;
-            } else {
-                cameraHudEl.innerText = "CAMERA LINK: SEARCHING FACE";
+            if (peripheralState.cameraArmed) {
+                const lockTxt = facePresent
+                    ? (faceCentered ? 'LOCKED' : `ALIGN ${Math.max(0, Math.min(99, Math.floor(faceLockDistance * 100)))}%`)
+                    : 'SEARCHING';
+                const camTxt = peripheralState.cameraLive ? `CAM: ARMED/${lockTxt}` : 'CAM: ARMED';
+                const micTxt = peripheralState.micArmed
+                    ? (peripheralState.micLive ? 'MIC: ARMED/LIVE' : 'MIC: ARMED')
+                    : 'MIC: DISARMED';
+                cameraHudEl.innerText = `${camTxt} | ${micTxt}`;
             }
 
             // Contradiction Alert
@@ -798,6 +801,54 @@
         });
 
         // ── Actions ──
+        // Keystroke timing (real browser capture — sent to server, not simulated)
+        let questionShownAt = 0;
+        let firstKeyAt = null;
+        let keyTimestamps = [];
+        let backspaceCount = 0;
+
+        function resetTypingMetrics() {
+            questionShownAt = Date.now();
+            firstKeyAt = null;
+            keyTimestamps = [];
+            backspaceCount = 0;
+        }
+
+        function onAnswerKeyDown(e) {
+            const now = Date.now();
+            if (firstKeyAt === null) firstKeyAt = now;
+            keyTimestamps.push(now);
+            if (e.key === 'Backspace') backspaceCount++;
+        }
+
+        function buildTypingMetrics() {
+            const txt = document.getElementById('answer-input').value.trim();
+            const words = txt ? txt.split(/\s+/).length : 0;
+            const end = Date.now();
+            const cognitive_delay = firstKeyAt
+                ? (firstKeyAt - questionShownAt) / 1000
+                : (end - questionShownAt) / 1000;
+            const duration = firstKeyAt ? (end - firstKeyAt) / 1000 : cognitive_delay;
+            let burst_volatility = 0;
+            if (keyTimestamps.length >= 2) {
+                const gaps = [];
+                for (let i = 1; i < keyTimestamps.length; i++) {
+                    gaps.push((keyTimestamps[i] - keyTimestamps[i - 1]) / 1000);
+                }
+                const mean = gaps.reduce((a, b) => a + b, 0) / gaps.length;
+                const variance = gaps.reduce((s, g) => s + (g - mean) ** 2, 0) / gaps.length;
+                burst_volatility = Math.sqrt(variance);
+            }
+            const wpm = duration > 0 && words > 0 ? (words / (duration / 60)) : 0;
+            return {
+                cognitive_delay: Math.round(cognitive_delay * 1000) / 1000,
+                duration: Math.round(Math.max(0.5, duration) * 1000) / 1000,
+                wpm: Math.round(wpm * 10) / 10,
+                burst_volatility: Math.round(burst_volatility * 10000) / 10000,
+                backspace_count: backspaceCount,
+            };
+        }
+
         function startSession(mode) {
             if (!canStartSession) {
                 const gate = document.getElementById('feature-gate-msg');
@@ -808,11 +859,46 @@
                 refreshFeatures();
                 return;
             }
-            socket.emit('start_session', {mode: mode});
+            let payload = { mode: mode };
+            if (mode === 3) {
+                const custom = prompt(
+                    'FRIEND TEST — Enter the custom question for the subject (operator only):'
+                );
+                if (custom === null) return;
+                const trimmed = custom.trim();
+                if (!trimmed) {
+                    alert('A custom question is required for Friend Test, or cancel to return.');
+                    return;
+                }
+                payload.custom_question = trimmed;
+            }
+            socket.emit('start_session', payload);
         }
+
+        let peripheralState = { cameraArmed: false, cameraLive: false, micArmed: false, micLive: false };
+        socket.on('peripheral_status', data => {
+            if (!data) return;
+            if (data.camera) {
+                peripheralState.cameraArmed = !!data.camera.armed;
+                peripheralState.cameraLive = !!data.camera.active;
+            }
+            if (data.microphone) {
+                peripheralState.micArmed = !!data.microphone.armed;
+                peripheralState.micLive = !!data.microphone.active;
+            }
+            const camTxt = peripheralState.cameraArmed
+                ? (peripheralState.cameraLive ? 'CAM: ARMED/LIVE' : 'CAM: ARMED')
+                : 'CAM: DISARMED';
+            const micTxt = peripheralState.micArmed
+                ? (peripheralState.micLive ? 'MIC: ARMED/LIVE' : 'MIC: ARMED')
+                : 'MIC: DISARMED';
+            cameraHudEl.innerText = `${camTxt} | ${micTxt}`;
+            cameraFeedEl.style.opacity = (peripheralState.cameraArmed && peripheralState.cameraLive) ? '0.92' : '0.2';
+        });
 
         socket.on('new_question', data => {
             sessionActive = true;
+            resetTypingMetrics();
             document.getElementById('q-text').innerText = `[Query ${data.number}]\n${data.question}`;
             document.getElementById('answer-input').value = '';
             document.getElementById('answer-warn').innerText = '';
@@ -836,7 +922,11 @@
             const q = document.getElementById('q-text').innerText.split('\n')[1] || '';
             const btn = document.getElementById('submit-btn');
             if(btn.classList.contains('disabled')) return;
-            socket.emit('submit_answer', {answer: txt, question: q});
+            socket.emit('submit_answer', {
+                answer: txt,
+                question: q,
+                typing_metrics: buildTypingMetrics(),
+            });
             setPhase('analyzing');
         }
 
@@ -861,12 +951,10 @@
             const vi = document.getElementById('res-icon');
             const vt = document.getElementById('res-verdict-text');
             
-            if(data.verdict === 'TRUTHFUL') {
-                vb.style.borderColor = '#00FF41'; vi.innerText = '✓'; vi.className = 'verdict-icon glow green'; vt.innerText = 'SUBJECT: TRUTHFUL'; vt.className = 'glow green';
-            } else if(data.verdict === 'DECEPTIVE') {
+            if(data.verdict === 'DECEPTIVE') {
                 vb.style.borderColor = '#FF0000'; vi.innerText = '✗'; vi.className = 'verdict-icon glow red'; vt.innerText = 'SUBJECT: DECEPTIVE'; vt.className = 'glow red';
             } else {
-                vb.style.borderColor = '#FF6600'; vi.innerText = '?'; vi.className = 'verdict-icon glow amber'; vt.innerText = 'SUBJECT: INCONCLUSIVE'; vt.className = 'glow amber';
+                vb.style.borderColor = '#00FF41'; vi.innerText = '✓'; vi.className = 'verdict-icon glow green'; vt.innerText = 'SUBJECT: TRUTHFUL'; vt.className = 'glow green';
             }
 
             // Score animation
