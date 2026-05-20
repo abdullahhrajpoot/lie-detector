@@ -52,6 +52,45 @@
         /* Biometrics UI */
         canvas { width: 100%; height: 60px; display: block; image-rendering: pixelated; margin-bottom: 4px; }
         canvas.tall { height: 120px; }
+        #camera-wrap {
+            position: relative;
+            width: 100%;
+            height: 190px;
+            margin-bottom: 6px;
+            border: 1px solid #114422;
+            background: #020402;
+            overflow: hidden;
+        }
+        #camera-feed {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+            filter: brightness(0.9) contrast(1.1) saturate(0.85);
+            opacity: 0.2;
+            transition: opacity 0.2s linear;
+        }
+        #face-overlay {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            margin-bottom: 0;
+        }
+        #camera-hud {
+            position: absolute;
+            left: 8px;
+            bottom: 7px;
+            font-size: 11px;
+            letter-spacing: 1px;
+            color: #00FF41;
+            text-shadow: 0 0 5px #00FF41;
+            background: rgba(0, 10, 0, 0.55);
+            padding: 2px 6px;
+        }
         
         .biomarker { display: flex; align-items: center; margin-bottom: 12px; font-size: 14px; }
         .bio-label { width: 140px; }
@@ -73,6 +112,36 @@
             font-family: inherit; font-size: 14px; transition: all 0.2s;
         }
         .menu-btn:hover { background: rgba(0,255,65,0.2); box-shadow: 0 0 10px #00FF41; }
+        .addon-board {
+            border: 1px dashed #00FF41;
+            padding: 8px;
+            margin-bottom: 12px;
+            background: rgba(0, 30, 0, 0.35);
+        }
+        .addon-actions { display: flex; gap: 8px; margin-bottom: 8px; }
+        .mini-btn {
+            background: transparent;
+            color: #00FF41;
+            border: 1px solid #00FF41;
+            font-family: inherit;
+            font-size: 11px;
+            padding: 4px 8px;
+            cursor: pointer;
+        }
+        .mini-btn.warn { color: #FF6600; border-color: #FF6600; }
+        .mini-btn.danger { color: #FF0000; border-color: #FF0000; }
+        #feature-list { max-height: 220px; overflow-y: auto; font-size: 11px; }
+        .feature-row {
+            display: grid;
+            grid-template-columns: 1fr auto auto auto;
+            gap: 6px;
+            align-items: center;
+            padding: 4px 0;
+            border-bottom: 1px dotted #154c1e;
+        }
+        .feature-status-ready { color: #00FF41; }
+        .feature-status-block { color: #FF6600; }
+        .feature-status-bad { color: #FF0000; }
 
         /* Question */
         .q-box { border: 1px solid #FF6600; padding: 15px; margin-bottom: 10px; font-size: 18px; line-height: 1.4; }
@@ -180,6 +249,19 @@
 ║ O P E R A T I O N S  K E R N E L       ║
 ╚════════════════════════════════════════╝
                     </pre>
+                    <div class="addon-board">
+                        <div class="cyan" style="font-size:12px; margin-bottom:6px;">ADD-ON CONTROL GATE (STRICT)</div>
+                        <div id="feature-gate-msg" class="amber" style="font-size:11px; margin-bottom:6px;">
+                            Configure all add-ons: enable+arm or disable.
+                        </div>
+                        <div class="addon-actions">
+                            <button class="mini-btn" onclick="bulkFeature('enable_all_available')">ENABLE ALL AVAILABLE</button>
+                            <button class="mini-btn warn" onclick="bulkFeature('disable_all')">DISABLE ALL (BASIC MODE)</button>
+                            <button class="mini-btn danger" onclick="bulkFeature('reset')">RESET</button>
+                            <button class="mini-btn" onclick="refreshFeatures()">REFRESH</button>
+                        </div>
+                        <div id="feature-list"></div>
+                    </div>
                     <button class="menu-btn" onclick="startSession(1)">[1] HONESTY TEST — Full behavioral profiling</button>
                     <button class="menu-btn" onclick="startSession(2)">[2] INTERROGATION MODE — Adaptive branching</button>
                     <button class="menu-btn" onclick="startSession(3)">[3] FRIEND TEST — 2-player custom question</button>
@@ -261,7 +343,12 @@
         <div class="panel">
             <div class="panel-title">◈ ACOUSTIC STRESS SENSOR ◈</div>
             <div class="panel-content">
-                <canvas id="voice-canvas" class="tall"></canvas>
+                <div id="camera-wrap">
+                    <img id="camera-feed" alt="Live biometric feed">
+                    <canvas id="face-overlay"></canvas>
+                    <div id="camera-hud">CAMERA LINK: STANDBY</div>
+                </div>
+                <canvas id="voice-canvas"></canvas>
             </div>
         </div>
 
@@ -325,6 +412,56 @@
             });
         }
 
+        let featureMatrix = [];
+        let canStartSession = false;
+        function statusClass(status) {
+            if (status === 'READY' || status === 'OFF') return 'feature-status-ready';
+            if (status === 'UNAVAILABLE') return 'feature-status-bad';
+            return 'feature-status-block';
+        }
+        function renderFeatureMatrix(features, canStart, blocking) {
+            featureMatrix = features || [];
+            canStartSession = !!canStart;
+            const list = document.getElementById('feature-list');
+            if (!list) return;
+            list.innerHTML = '';
+            featureMatrix.forEach(f => {
+                const row = document.createElement('div');
+                row.className = 'feature-row';
+                const enableLabel = f.enabled === true ? 'ON' : (f.enabled === false ? 'OFF' : 'UNSET');
+                const armBtn = f.manual_arm
+                    ? `<button class="mini-btn" onclick="setFeature('${f.key}','${f.armed ? 'disarm' : 'arm'}')">${f.armed ? 'DISARM' : 'ARM'}</button>`
+                    : `<span class="dim">-</span>`;
+                row.innerHTML = `
+                    <span class="${statusClass(f.status)}">${f.label} [${f.status}]</span>
+                    <button class="mini-btn" onclick="setFeature('${f.key}','enable')">ENABLE</button>
+                    <button class="mini-btn warn" onclick="setFeature('${f.key}','disable')">DISABLE</button>
+                    ${armBtn}
+                `;
+                list.appendChild(row);
+            });
+
+            const gate = document.getElementById('feature-gate-msg');
+            if (!gate) return;
+            if (canStartSession) {
+                gate.className = 'green';
+                gate.innerText = 'All add-ons resolved. Session launch is allowed.';
+            } else {
+                const cnt = (blocking || []).length;
+                gate.className = 'red glow';
+                gate.innerText = `Launch blocked: ${cnt} add-on(s) unresolved (UNSET / NEEDS_ARM / UNAVAILABLE).`;
+            }
+        }
+        function setFeature(key, action) {
+            socket.emit('set_feature', { key, action });
+        }
+        function bulkFeature(action) {
+            socket.emit('bulk_feature_action', { action });
+        }
+        function refreshFeatures() {
+            socket.emit('request_feature_matrix', {});
+        }
+
         // ── Blinking Cursor ──
         setInterval(() => {
             const c = document.getElementById('cursor');
@@ -363,16 +500,27 @@
         const rrCtx = document.getElementById('rr-canvas').getContext('2d');
         const scCtx = document.getElementById('sc-canvas').getContext('2d');
         const voiceCtx = document.getElementById('voice-canvas').getContext('2d');
+        const faceOverlayCtx = document.getElementById('face-overlay').getContext('2d');
+        const cameraFeedEl = document.getElementById('camera-feed');
+        const cameraHudEl = document.getElementById('camera-hud');
         
-        // Fix resolutions
-        document.querySelectorAll('canvas').forEach(c => {
-            c.width = c.clientWidth * 2;
-            c.height = c.clientHeight * 2;
-        });
+        function resizeCanvases() {
+            document.querySelectorAll('canvas').forEach(c => {
+                c.width = Math.max(1, Math.floor(c.clientWidth * 2));
+                c.height = Math.max(1, Math.floor(c.clientHeight * 2));
+            });
+        }
+        resizeCanvases();
+        window.addEventListener('resize', resizeCanvases);
 
         // ── Animations & Live View ──
         let timeAcc = 0;
         let voiceData = new Array(40).fill(0);
+        let latestFaceBox = null;
+        let faceCentered = false;
+        let facePresent = false;
+        let faceLockDistance = 1.0;
+        let smoothFace = { cx: 0.5, cy: 0.5, size: 0.18 };
         
         function drawLineWave(ctx, t, freq, speed, height, color) {
             const w = ctx.canvas.width; const h = ctx.canvas.height;
@@ -404,6 +552,89 @@
             }
         }
 
+        function drawHex(ctx, cx, cy, radius, rotation, color, lineWidth, alpha=1.0) {
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.beginPath();
+            for (let i = 0; i < 6; i++) {
+                const a = rotation + (Math.PI / 3) * i;
+                const px = cx + Math.cos(a) * radius;
+                const py = cy + Math.sin(a) * radius;
+                if (i === 0) ctx.moveTo(px, py);
+                else ctx.lineTo(px, py);
+            }
+            ctx.closePath();
+            ctx.strokeStyle = color;
+            ctx.lineWidth = lineWidth;
+            ctx.shadowBlur = 8;
+            ctx.shadowColor = color;
+            ctx.stroke();
+            ctx.restore();
+        }
+
+        function drawFaceOverlay(ctx, t) {
+            const w = ctx.canvas.width;
+            const h = ctx.canvas.height;
+            ctx.clearRect(0, 0, w, h);
+
+            ctx.strokeStyle = 'rgba(0,255,65,0.08)';
+            ctx.lineWidth = 1;
+            for (let gy = 0; gy < h; gy += 20) {
+                ctx.beginPath();
+                ctx.moveTo(0, gy);
+                ctx.lineTo(w, gy);
+                ctx.stroke();
+            }
+
+            const tx = w * 0.5;
+            const ty = h * 0.5;
+            const targetR = Math.min(w, h) * 0.17;
+            drawHex(ctx, tx, ty, targetR, t * 0.35, '#00FF41', 1.5, 0.65);
+            drawHex(ctx, tx, ty, targetR * 0.72, -t * 0.5, '#00FFFF', 1.2, 0.55);
+
+            if (!facePresent || !latestFaceBox) {
+                ctx.fillStyle = '#FF0000';
+                ctx.font = `${Math.max(20, Math.floor(h * 0.08))}px Courier New`;
+                ctx.fillText('NO FACE LOCK', 18, h - 20);
+                return;
+            }
+
+            const bx = latestFaceBox.x * w;
+            const by = latestFaceBox.y * h;
+            const bw = latestFaceBox.w * w;
+            const bh = latestFaceBox.h * h;
+            const cx = (latestFaceBox.cx ?? (latestFaceBox.x + latestFaceBox.w / 2)) * w;
+            const cy = (latestFaceBox.cy ?? (latestFaceBox.y + latestFaceBox.h / 2)) * h;
+            const size = Math.max(bw, bh) * 0.62;
+
+            smoothFace.cx += (cx - smoothFace.cx) * 0.22;
+            smoothFace.cy += (cy - smoothFace.cy) * 0.22;
+            smoothFace.size += (size - smoothFace.size) * 0.18;
+
+            const pulse = 1 + Math.sin(t * 8) * 0.07;
+            const ringColor = faceCentered ? '#00FFFF' : '#FF6600';
+
+            ctx.strokeStyle = 'rgba(0,255,65,0.6)';
+            ctx.lineWidth = 1.4;
+            ctx.strokeRect(bx, by, bw, bh);
+
+            drawHex(ctx, smoothFace.cx, smoothFace.cy, smoothFace.size * pulse, t * 1.2, ringColor, 2.2, 0.95);
+            drawHex(ctx, smoothFace.cx, smoothFace.cy, smoothFace.size * 0.72, -t * 0.9, '#00FF41', 1.5, 0.85);
+
+            ctx.beginPath();
+            ctx.moveTo(tx, ty);
+            ctx.lineTo(smoothFace.cx, smoothFace.cy);
+            ctx.strokeStyle = faceCentered ? '#00FFFF' : '#FF6600';
+            ctx.lineWidth = 1.2;
+            ctx.shadowBlur = 6;
+            ctx.shadowColor = ctx.strokeStyle;
+            ctx.stroke();
+
+            ctx.fillStyle = faceCentered ? '#00FFFF' : '#FF6600';
+            ctx.font = `${Math.max(20, Math.floor(h * 0.085))}px Courier New`;
+            ctx.fillText(faceCentered ? 'FACE LOCKED' : 'CENTER FACE', 18, h - 20);
+        }
+
         function renderLoop() {
             timeAcc += 0.016;
             drawLineWave(hrCtx, timeAcc, 1.0, 3.0, hrCtx.canvas.height-10, '#00FF41');
@@ -422,6 +653,7 @@
             scCtx.stroke();
 
             drawVoiceBars(voiceCtx, voiceData);
+            drawFaceOverlay(faceOverlayCtx, timeAcc);
             requestAnimationFrame(renderLoop);
         }
         requestAnimationFrame(renderLoop);
@@ -474,6 +706,22 @@
             setPhase('menu');
         });
 
+        socket.on('feature_matrix', data => {
+            renderFeatureMatrix(data.features || [], !!data.can_start, data.blocking || []);
+        });
+
+        socket.on('session_blocked', data => {
+            setPhase('menu');
+            const gate = document.getElementById('feature-gate-msg');
+            if (gate) {
+                gate.className = 'red glow';
+                gate.innerText = data.reason || 'Session blocked by add-on readiness gate.';
+            }
+            if (data.blocking && data.blocking.length) {
+                renderFeatureMatrix(featureMatrix, false, data.blocking);
+            }
+        });
+
         socket.on('sensor_update', data => {
             // Header
             els.uptime.innerText = _fmtTime(data.uptime);
@@ -516,6 +764,17 @@
             document.getElementById('face-away').innerText = f.look_away;
             document.getElementById('face-away').className = f.look_away > 2 ? 'red glow' : 'green';
             document.getElementById('face-var').innerText = f.variance.toFixed(3);
+            facePresent = !!f.detected;
+            latestFaceBox = f.box || null;
+            faceCentered = !!f.centered;
+            faceLockDistance = typeof f.distance === 'number' ? f.distance : 1.0;
+            if (facePresent) {
+                cameraHudEl.innerText = faceCentered
+                    ? "CAMERA LINK: TARGET LOCKED"
+                    : `CAMERA LINK: ALIGNING (${Math.max(0, Math.min(99, Math.floor(faceLockDistance * 100)))}%)`;
+            } else {
+                cameraHudEl.innerText = "CAMERA LINK: SEARCHING FACE";
+            }
 
             // Contradiction Alert
             const alertBox = document.getElementById('contradiction-overlay');
@@ -528,8 +787,24 @@
             }
         });
 
+        socket.on('face_frame', data => {
+            if (data && data.jpg) {
+                cameraFeedEl.src = `data:image/jpeg;base64,${data.jpg}`;
+                cameraFeedEl.style.opacity = '0.92';
+            }
+        });
+
         // ── Actions ──
         function startSession(mode) {
+            if (!canStartSession) {
+                const gate = document.getElementById('feature-gate-msg');
+                if (gate) {
+                    gate.className = 'red glow';
+                    gate.innerText = 'Cannot start: resolve all add-on gates first.';
+                }
+                refreshFeatures();
+                return;
+            }
             socket.emit('start_session', {mode: mode});
         }
 
@@ -639,6 +914,10 @@
                     }, 20);
                 }, data.flags.length * 200 + 1000);
             }
+            if (data.explainability && data.explainability.length) {
+                const expText = "\n\n[EXPLAINABILITY]\n" + data.explainability.join("\n");
+                setTimeout(() => { ain.innerText += expText; }, data.flags.length * 200 + 1200);
+            }
         });
 
         function nextQuestion() { socket.emit('next_question', {}); }
@@ -662,10 +941,18 @@
             const prf = document.getElementById('rep-profile');
             prf.innerText = '';
             const ptext = typeof data.profile === 'string' ? data.profile : JSON.stringify(data.profile);
+            const baselineText = data.baseline
+                ? `\n\nBASELINE DELTA\nPrior Avg: ${data.baseline.prior_avg_lie}% | Current Avg: ${data.baseline.current_avg_lie}% | Delta: ${data.baseline.delta}%`
+                : '';
+            const evidenceText = data.evidence_tip ? `\n\nEVIDENCE CHAIN TIP\n${data.evidence_tip}` : '';
+            const timelineText = data.timeline_tail && data.timeline_tail.length
+                ? `\n\nTIMELINE EVENTS: ${data.timeline_tail.length} captured`
+                : '';
+            const fullText = ptext + baselineText + evidenceText + timelineText;
             let cIdx = 0;
             const typ = setInterval(() => {
-                prf.innerText += ptext[cIdx] || '';
-                cIdx++; if(cIdx >= ptext.length) clearInterval(typ);
+                prf.innerText += fullText[cIdx] || '';
+                cIdx++; if(cIdx >= fullText.length) clearInterval(typ);
             }, 10);
         });
 

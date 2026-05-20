@@ -1,5 +1,6 @@
 import threading
 import time
+import base64
 from dataclasses import dataclass, field
 import numpy as np
 
@@ -42,6 +43,9 @@ class FaceTracker:
         self.gaze_stability = 1.0
         self.look_away_count = 0
         self.position_history = []
+        self.last_face_box = None
+        self.frame_size = (0, 0)
+        self.latest_frame = None
         self.cap = None
         
         if FACE_AVAILABLE:
@@ -60,6 +64,8 @@ class FaceTracker:
                     with self.lock:
                         self.face_detected = False
                         self.look_away_count += 1
+                        self.latest_frame = None
+                        self.last_face_box = None
                     time.sleep(0.1)
                     continue
                 
@@ -67,9 +73,12 @@ class FaceTracker:
                 faces = self.face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
                 
                 with self.lock:
+                    self.frame_size = (int(frame.shape[1]), int(frame.shape[0]))
+                    self.latest_frame = frame.copy()
                     if len(faces) > 0:
                         self.face_detected = True
-                        x, y, w, h = faces[0]
+                        x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                        self.last_face_box = (int(x), int(y), int(w), int(h))
                         # Confidence normalized by arbitrary image size ratio
                         self.face_confidence = min(1.0, (w * h) / (frame.shape[0] * frame.shape[1] * 0.5))
                         center = (x + w/2, y + h/2)
@@ -86,6 +95,7 @@ class FaceTracker:
                         if self.face_detected:
                             self.look_away_count += 1
                         self.face_detected = False
+                        self.last_face_box = None
                         
                 time.sleep(0.1)
         except Exception:
@@ -93,6 +103,8 @@ class FaceTracker:
 
     def start(self):
         if not FACE_AVAILABLE:
+            return
+        if self.is_tracking:
             return
             
         self.cap = cv2.VideoCapture(0)
@@ -104,6 +116,9 @@ class FaceTracker:
         self.gaze_stability = 1.0
         self.look_away_count = 0
         self.position_history = []
+        self.last_face_box = None
+        self.frame_size = (0, 0)
+        self.latest_frame = None
         
         self.thread = threading.Thread(target=self._track_loop, daemon=True)
         self.thread.start()
@@ -119,6 +134,9 @@ class FaceTracker:
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+        with self.lock:
+            self.latest_frame = None
+            self.last_face_box = None
 
     def get_current_stats(self) -> FaceStats:
         if not FACE_AVAILABLE:
@@ -165,6 +183,64 @@ class FaceTracker:
             self.position_history = []
             
             return stats
+
+    def get_overlay_state(self) -> dict:
+        if not FACE_AVAILABLE:
+            return {"detected": False, "box": None, "centered": False, "distance": 1.0}
+
+        with self.lock:
+            detected = bool(self.face_detected)
+            box = self.last_face_box
+            fw, fh = self.frame_size
+
+        if not detected or not box or fw <= 0 or fh <= 0:
+            return {"detected": False, "box": None, "centered": False, "distance": 1.0}
+
+        x, y, w, h = box
+        cx = (x + (w / 2.0)) / fw
+        cy = (y + (h / 2.0)) / fh
+        tx, ty = 0.5, 0.5
+        dist = float(np.sqrt((cx - tx) ** 2 + (cy - ty) ** 2))
+
+        return {
+            "detected": True,
+            "box": {
+                "x": x / fw,
+                "y": y / fh,
+                "w": w / fw,
+                "h": h / fh,
+                "cx": cx,
+                "cy": cy,
+            },
+            "centered": dist <= 0.08,
+            "distance": dist,
+        }
+
+    def get_latest_frame_jpeg(self, max_width: int = 640, quality: int = 70):
+        if not FACE_AVAILABLE:
+            return None
+
+        with self.lock:
+            frame = None if self.latest_frame is None else self.latest_frame.copy()
+
+        if frame is None:
+            return None
+
+        try:
+            h, w = frame.shape[:2]
+            if max_width > 0 and w > max_width:
+                scale = max_width / float(w)
+                frame = cv2.resize(frame, (max_width, int(h * scale)))
+            ok, encoded = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), int(max(30, min(95, quality)))]
+            )
+            if not ok:
+                return None
+            return base64.b64encode(encoded.tobytes()).decode("ascii")
+        except Exception:
+            return None
 
     def get_live_frame_ascii(self, width: int, height: int) -> str:
         if not FACE_AVAILABLE:

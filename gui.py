@@ -6,6 +6,8 @@ import random
 import math
 import webbrowser
 import json
+import hashlib
+from collections import deque
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit
 
@@ -95,6 +97,124 @@ _state = {
     "session_id": f"PTH-{random.randint(10000,99999)}",
 }
 _state_lock = threading.Lock()
+_feature_lock = threading.Lock()
+_BASELINE_PATH = "baseline_profiles.json"
+
+_FEATURE_DEFS = {
+    "camera_feed": {"label": "Live Camera Feed", "manual_arm": True, "available": FACE_AVAILABLE},
+    "microphone_sensor": {"label": "Microphone Sensor", "manual_arm": True, "available": VOICE_AVAILABLE},
+    "ai_forensics": {"label": "AI Forensic Analysis", "manual_arm": False, "available": AI_AVAILABLE},
+    "temporal_fusion": {"label": "Temporal Fusion Model", "manual_arm": False, "available": True},
+    "face_mesh_lock": {"label": "Face Lock Polygon Engine", "manual_arm": False, "available": FACE_AVAILABLE},
+    "audio_forensics": {"label": "Audio Forensics Layer", "manual_arm": False, "available": VOICE_AVAILABLE},
+    "contradiction_graph": {"label": "Contradiction Knowledge Graph", "manual_arm": False, "available": True},
+    "adaptive_interrogation": {"label": "Adaptive Interrogation Policy", "manual_arm": False, "available": True},
+    "explainability": {"label": "Confidence + Explainability", "manual_arm": False, "available": True},
+    "replay_timeline": {"label": "Forensic Replay Timeline", "manual_arm": False, "available": True},
+    "anti_spoof": {"label": "Anti-Spoof & Liveness", "manual_arm": False, "available": FACE_AVAILABLE or VOICE_AVAILABLE},
+    "evidence_chain": {"label": "Evidence Integrity Chain", "manual_arm": False, "available": True},
+    "privacy_guard": {"label": "Local Privacy Guard", "manual_arm": False, "available": True},
+    "subject_baseline": {"label": "Subject Baseline Profiles", "manual_arm": False, "available": True},
+    "model_lifecycle": {"label": "Model Lifecycle Telemetry", "manual_arm": False, "available": True},
+}
+
+_feature_state = {
+    k: {"enabled": None, "armed": False, "available": bool(v["available"])}
+    for k, v in _FEATURE_DEFS.items()
+}
+
+_fusion_window = deque(maxlen=8)
+_timeline = []
+_evidence_chain_tip = "GENESIS"
+_baseline_profiles = {}
+
+def _load_baselines():
+    global _baseline_profiles
+    try:
+        if os.path.exists(_BASELINE_PATH):
+            with open(_BASELINE_PATH, "r", encoding="utf-8") as f:
+                _baseline_profiles = json.load(f)
+    except Exception:
+        _baseline_profiles = {}
+
+def _save_baselines():
+    try:
+        with open(_BASELINE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_baseline_profiles, f, indent=2)
+    except Exception:
+        pass
+
+def _log_timeline(event_type: str, payload: dict):
+    global _evidence_chain_tip
+    now = time.time()
+    item = {"ts": now, "type": event_type, "payload": payload}
+    raw = json.dumps(item, sort_keys=True, default=str).encode("utf-8")
+    _evidence_chain_tip = hashlib.sha256((_evidence_chain_tip + raw.hex()).encode("utf-8")).hexdigest()
+    item["chain"] = _evidence_chain_tip
+    _timeline.append(item)
+    if len(_timeline) > 1200:
+        del _timeline[:300]
+
+def _feature_matrix():
+    out = []
+    with _feature_lock:
+        for key, meta in _FEATURE_DEFS.items():
+            st = _feature_state[key]
+            enabled = st["enabled"]
+            armed = st["armed"]
+            available = st["available"]
+            if enabled is None:
+                status = "UNSET"
+            elif enabled is False:
+                status = "OFF"
+            elif not available:
+                status = "UNAVAILABLE"
+            elif meta["manual_arm"] and not armed:
+                status = "NEEDS_ARM"
+            else:
+                status = "READY"
+            out.append({
+                "key": key,
+                "label": meta["label"],
+                "enabled": enabled,
+                "armed": armed,
+                "available": available,
+                "manual_arm": meta["manual_arm"],
+                "status": status,
+            })
+    return out
+
+def _broadcast_feature_matrix():
+    matrix = _feature_matrix()
+    blocking = [m for m in matrix if m["status"] in ("UNSET", "UNAVAILABLE", "NEEDS_ARM")]
+    socketio.emit("feature_matrix", {
+        "features": matrix,
+        "can_start": len(blocking) == 0,
+        "blocking": blocking,
+    })
+
+def _validate_feature_readiness():
+    matrix = _feature_matrix()
+    blocking = [m for m in matrix if m["status"] in ("UNSET", "UNAVAILABLE", "NEEDS_ARM")]
+    return len(blocking) == 0, blocking
+
+def _feature_enabled(key: str) -> bool:
+    with _feature_lock:
+        return _feature_state.get(key, {}).get("enabled") is True
+
+def _feature_armed(key: str) -> bool:
+    with _feature_lock:
+        return _feature_state.get(key, {}).get("armed") is True
+
+def _arm_feature(feature_key: str):
+    if feature_key == "camera_feed" and FACE_AVAILABLE and _face:
+        if not _face.is_tracking:
+            _face.start()
+    if feature_key == "microphone_sensor" and VOICE_AVAILABLE and _voice:
+        # Manual arm intent; recording still starts per question.
+        pass
+
+_load_baselines()
 
 def _used_questions():
     global USED_QUESTIONS
@@ -115,8 +235,13 @@ def _sensor_loop():
     while True:
         t = time.time() - t0
 
+        mic_enabled = _feature_enabled("microphone_sensor")
+        mic_armed = _feature_armed("microphone_sensor")
+        cam_enabled = _feature_enabled("camera_feed")
+        cam_armed = _feature_armed("camera_feed")
+
         # Voice waveform
-        if VOICE_AVAILABLE and _voice:
+        if mic_enabled and mic_armed and VOICE_AVAILABLE and _voice:
             try:
                 wf = _voice.get_live_waveform(40)
             except Exception:
@@ -126,23 +251,40 @@ def _sensor_loop():
                   for i in range(40)]
 
         # Face stats
-        if FACE_AVAILABLE and _face:
+        if cam_enabled and cam_armed and FACE_AVAILABLE and _face:
             try:
+                if not _face.is_tracking:
+                    _face.start()
                 fs = _face.get_current_stats()
+                overlay = _face.get_overlay_state()
                 face_data = {
                     "detected": fs.face_detected,
                     "stability": fs.gaze_stability,
                     "look_away": fs.look_away_count,
                     "variance": fs.face_position_variance,
+                    "box": overlay.get("box"),
+                    "centered": overlay.get("centered", False),
+                    "distance": overlay.get("distance", 1.0),
                 }
             except Exception:
-                face_data = {"detected": False, "stability": 0, "look_away": 0, "variance": 0}
+                face_data = {
+                    "detected": False,
+                    "stability": 0,
+                    "look_away": 0,
+                    "variance": 0,
+                    "box": None,
+                    "centered": False,
+                    "distance": 1.0,
+                }
         else:
             face_data = {
-                "detected": bool(math.sin(t * 0.3) > -0.5),
-                "stability": 0.5 + 0.4 * math.sin(t * 0.7),
+                "detected": False,
+                "stability": 0.0,
                 "look_away": 0,
-                "variance": 0.02,
+                "variance": 0.0,
+                "box": None,
+                "centered": False,
+                "distance": 1.0,
             }
 
         # Biomarkers (always animated)
@@ -179,7 +321,24 @@ def _sensor_loop():
             'last_flags': state_copy['last_flags'],
             'last_ai_note': state_copy['last_ai_note'],
             'last_technique': state_copy['last_technique'],
+            'evidence_tip': _evidence_chain_tip[:16] if _feature_enabled("evidence_chain") else "",
         })
+
+        if _feature_enabled("replay_timeline"):
+            _log_timeline("sensor", {
+                "hr": hr,
+                "rr": rr,
+                "face_detected": face_data.get("detected", False),
+                "voice_energy": round(float(sum(wf) / max(1, len(wf))), 4),
+            })
+
+        if cam_enabled and cam_armed and FACE_AVAILABLE and _face:
+            try:
+                frame_jpg = _face.get_latest_frame_jpeg(max_width=720, quality=65)
+                if frame_jpg:
+                    socketio.emit('face_frame', {'jpg': frame_jpg})
+            except Exception:
+                pass
         time.sleep(0.1)
 
 # \u2500\u2500 Answer processing (runs in background thread) \u2500\u2500\u2500\u2500\u2500
@@ -204,7 +363,7 @@ def _process_answer(answer_text, question_text):
         )
 
         # Voice
-        if VOICE_AVAILABLE and _voice:
+        if _feature_enabled("microphone_sensor") and _feature_armed("microphone_sensor") and VOICE_AVAILABLE and _voice:
             try:
                 voice_result = _voice.stop_recording()
             except Exception:
@@ -213,7 +372,7 @@ def _process_answer(answer_text, question_text):
             voice_result = _get_empty_voice()
 
         # Face
-        if FACE_AVAILABLE and _face:
+        if _feature_enabled("camera_feed") and _feature_armed("camera_feed") and FACE_AVAILABLE and _face:
             try:
                 face_stats = _face.get_current_stats()
             except Exception:
@@ -222,14 +381,14 @@ def _process_answer(answer_text, question_text):
             face_stats = _get_empty_face()
 
         # Contradiction
-        if _contradiction:
+        if _feature_enabled("contradiction_graph") and _contradiction:
             contradiction = _contradiction.check_contradiction(answer_text)
         else:
             contradiction = _get_empty_contradiction()
 
         # AI analysis
         socketio.emit('status_msg', {'msg': 'RUNNING FORENSIC LINGUISTIC ANALYSIS...'})
-        if _ai and AI_AVAILABLE:
+        if _feature_enabled("ai_forensics") and _ai and AI_AVAILABLE:
             history = _contradiction.get_timeline() if _contradiction else []
             ai_result = _ai.analyze(answer_text, question_text, history)
         else:
@@ -245,8 +404,52 @@ def _process_answer(answer_text, question_text):
                      "confidence": "LOW", "flags": [], "source_breakdown": {}}
 
         score['question'] = question_text
+        score['addon_signals'] = {}
 
-        if _contradiction:
+        # Anti-spoof / liveness heuristics.
+        if _feature_enabled("anti_spoof"):
+            spoof_risk = 0
+            if getattr(face_stats, "face_detected", False) and getattr(face_stats, "gaze_stability", 0.0) > 0.995:
+                spoof_risk += 12
+            if getattr(voice_result, "amplitude_variance", 0.0) < 0.0004 and _feature_enabled("microphone_sensor"):
+                spoof_risk += 10
+            if spoof_risk >= 12:
+                score['flags'] = list(score.get('flags', [])) + ["LIVENESS ALERT: POSSIBLE SPOOF SIGNATURE"]
+                score['lie_probability'] = min(99, int(score['lie_probability'] + spoof_risk * 0.4))
+            score['addon_signals']['spoof_risk'] = spoof_risk
+
+        # Temporal fusion model (lightweight online sequence fusion).
+        if _feature_enabled("temporal_fusion"):
+            _fusion_window.append(float(score['lie_probability']))
+            fused = sum(_fusion_window) / len(_fusion_window)
+            spread = max(_fusion_window) - min(_fusion_window) if len(_fusion_window) > 1 else 0.0
+            uncertainty = max(0.0, min(1.0, spread / 60.0))
+            score['addon_signals']['fused_lie_probability'] = round(fused, 2)
+            score['addon_signals']['uncertainty'] = round(uncertainty, 3)
+            score['lie_probability'] = int(round((0.65 * score['lie_probability']) + (0.35 * fused)))
+            if uncertainty > 0.55:
+                score['flags'] = list(score.get('flags', [])) + ["HIGH TEMPORAL UNCERTAINTY"]
+
+        if _feature_enabled("audio_forensics"):
+            score['addon_signals']['audio_forensics'] = {
+                "variance": round(float(getattr(voice_result, "amplitude_variance", 0.0)), 6),
+                "silence_ratio": round(float(getattr(voice_result, "silence_ratio", 1.0)), 4),
+            }
+
+        if _feature_enabled("face_mesh_lock"):
+            score['addon_signals']['face_lock'] = {
+                "stability": round(float(getattr(face_stats, "gaze_stability", 0.0)), 4),
+                "look_away_count": int(getattr(face_stats, "look_away_count", 0)),
+            }
+
+        if _feature_enabled("explainability"):
+            score['explainability'] = [
+                f"Fusion P(X): {score['addon_signals'].get('fused_lie_probability', score['lie_probability'])}%",
+                f"Sensor stability: face={round(float(getattr(face_stats, 'gaze_stability', 0.0)), 3)} voice_var={round(float(getattr(voice_result, 'amplitude_variance', 0.0)), 5)}",
+                f"Evidence chain tip: {_evidence_chain_tip[:12]}",
+            ]
+
+        if _feature_enabled("contradiction_graph") and _contradiction:
             _contradiction.add_answer(question_text, answer_text, score)
 
         # Update state
@@ -262,9 +465,12 @@ def _process_answer(answer_text, question_text):
             _state['last_flags'] = score.get('flags', [])[:8]
             _state['last_ai_note'] = score.get('ai_profile_note', '')
             _state['last_technique'] = score.get('deception_technique', '') or ''
+            stored_answer = answer_text
+            if _feature_enabled("privacy_guard"):
+                stored_answer = f"[REDACTED:{hashlib.sha256(answer_text.encode('utf-8')).hexdigest()[:12]}]"
             _state['session_history'].append({
                 'question': question_text,
-                'answer': answer_text,
+                'answer': stored_answer,
                 'score': score
             })
             if contradiction and hasattr(contradiction, 'detected') and contradiction.detected:
@@ -276,6 +482,13 @@ def _process_answer(answer_text, question_text):
             _state['last_score_full'] = score
             _state['phase'] = 'result'
 
+        if _feature_enabled("replay_timeline"):
+            _log_timeline("answer_scored", {
+                "question": question_text[:120],
+                "lie_probability": score.get("lie_probability"),
+                "verdict": score.get("verdict"),
+            })
+
         socketio.emit('answer_scored', {
             'lie_probability': score['lie_probability'],
             'verdict': score.get('verdict', 'INCONCLUSIVE'),
@@ -285,6 +498,8 @@ def _process_answer(answer_text, question_text):
             'technique': score.get('deception_technique', '') or '',
             'source_breakdown': score.get('source_breakdown', {}),
             'contradiction': contradiction.detected if contradiction and hasattr(contradiction,'detected') else False,
+            'addon_signals': score.get('addon_signals', {}),
+            'explainability': score.get('explainability', []),
         })
 
     except Exception as e:
@@ -335,11 +550,93 @@ def on_connect():
         'voice': VOICE_AVAILABLE,
         'face': FACE_AVAILABLE,
         'session_id': _state['session_id'],
+        'model_lifecycle': {
+            'scorer_loaded': SCORER_OK,
+            'analyzer_loaded': ANALYZER_OK,
+            'ai_model': 'gemini-1.5-flash' if AI_AVAILABLE else 'offline',
+            'build': 'polytruth-v5-addon-pack',
+        },
     })
+    emit('feature_matrix', {
+        'features': _feature_matrix(),
+        'can_start': _validate_feature_readiness()[0],
+        'blocking': _validate_feature_readiness()[1],
+    })
+
+@socketio.on('set_feature')
+def on_set_feature(data):
+    key = str(data.get('key', '')).strip()
+    action = str(data.get('action', '')).strip().lower()
+    if key not in _FEATURE_DEFS:
+        emit('error_msg', {'msg': f'Unknown feature: {key}'})
+        return
+
+    with _feature_lock:
+        st = _feature_state[key]
+        if action == 'enable':
+            st['enabled'] = True
+        elif action == 'disable':
+            st['enabled'] = False
+            st['armed'] = False
+        elif action == 'arm':
+            st['armed'] = True
+        elif action == 'disarm':
+            st['armed'] = False
+        else:
+            emit('error_msg', {'msg': f'Unknown action: {action}'})
+            return
+
+    if action == 'arm':
+        try:
+            _arm_feature(key)
+        except Exception:
+            pass
+
+    _broadcast_feature_matrix()
+
+@socketio.on('bulk_feature_action')
+def on_bulk_feature_action(data):
+    action = str(data.get('action', '')).strip().lower()
+    with _feature_lock:
+        for key, st in _feature_state.items():
+            if action == 'disable_all':
+                st['enabled'] = False
+                st['armed'] = False
+            elif action == 'enable_all_available':
+                st['enabled'] = bool(_FEATURE_DEFS[key]["available"])
+                if not st['enabled']:
+                    st['armed'] = False
+            elif action == 'reset':
+                st['enabled'] = None
+                st['armed'] = False
+    if action == 'enable_all_available':
+        for key in _FEATURE_DEFS:
+            if _FEATURE_DEFS[key]["manual_arm"]:
+                continue
+            # non-manual features are considered armed by design
+            pass
+    _broadcast_feature_matrix()
+
+@socketio.on('request_feature_matrix')
+def on_request_feature_matrix(_data=None):
+    _broadcast_feature_matrix()
 
 @socketio.on('start_session')
 def on_start_session(data):
+    ready, blocking = _validate_feature_readiness()
+    if not ready:
+        emit('session_blocked', {
+            'reason': 'Enable or disable every promised add-on, and arm required hardware first.',
+            'blocking': blocking,
+        })
+        _broadcast_feature_matrix()
+        return
+
     mode = int(data.get('mode', 1))
+    _fusion_window.clear()
+    _timeline.clear()
+    global _evidence_chain_tip
+    _evidence_chain_tip = "GENESIS"
     with _state_lock:
         _state['mode'] = mode
         _state['phase'] = 'question'
@@ -351,7 +648,7 @@ def on_start_session(data):
         _state['truthful_count'] = 0
         _state['inconclusive_count'] = 0
         _state['final_report'] = None
-    if FACE_AVAILABLE and _face:
+    if _feature_enabled("camera_feed") and _feature_armed("camera_feed") and FACE_AVAILABLE and _face:
         try: _face.start()
         except Exception: pass
     q = _pick_question(QUESTION_BANK)
@@ -366,7 +663,7 @@ def on_submit_answer(data):
     if len(answer.split()) < 15:
         emit('answer_rejected', {'reason': 'MINIMUM 15 WORDS REQUIRED. SYSTEM DEMANDS FULL NARRATIVE.'})
         return
-    if VOICE_AVAILABLE and _voice:
+    if _feature_enabled("microphone_sensor") and _feature_armed("microphone_sensor") and VOICE_AVAILABLE and _voice:
         try: _voice.start_recording()
         except Exception: pass
     t = threading.Thread(target=_process_answer, args=(answer, question), daemon=True)
@@ -388,9 +685,20 @@ def on_next_question(data):
     # Interrogation mode branching
     pool = QUESTION_BANK
     if mode == 2 and last:
-        v = last.get('verdict','')
-        if v == 'DECEPTIVE': pool = FOLLOWUP_DECEPTIVE
-        elif v == 'TRUTHFUL': pool = FOLLOWUP_TRUTHFUL
+        if _feature_enabled("adaptive_interrogation"):
+            uncertainty = float(last.get("addon_signals", {}).get("uncertainty", 0.4))
+            if uncertainty > 0.5:
+                pool = QUESTION_BANK
+            else:
+                v = last.get('verdict','')
+                if v == 'DECEPTIVE':
+                    pool = FOLLOWUP_DECEPTIVE
+                elif v == 'TRUTHFUL':
+                    pool = FOLLOWUP_TRUTHFUL
+        else:
+            v = last.get('verdict','')
+            if v == 'DECEPTIVE': pool = FOLLOWUP_DECEPTIVE
+            elif v == 'TRUTHFUL': pool = FOLLOWUP_TRUTHFUL
 
     q = _pick_question(pool)
     with _state_lock:
@@ -408,11 +716,12 @@ def _generate_final_report():
         _state['phase'] = 'report'
         history = list(_state['session_history'])
         scores = list(_state['scores'])
+        session_id = _state['session_id']
 
     socketio.emit('status_msg', {'msg': 'GENERATING FORENSIC PROFILE...'})
 
     profile = "Session complete. Behavioral profile archived."
-    if _ai and AI_AVAILABLE:
+    if _feature_enabled("ai_forensics") and _ai and AI_AVAILABLE:
         try:
             answers = [h['answer'] for h in history]
             all_scores = [h['score'] for h in history]
@@ -431,6 +740,23 @@ def _generate_final_report():
     else:
         overall = "ANALYSIS INCONCLUSIVE"
 
+    baseline_note = None
+    if _feature_enabled("subject_baseline"):
+        prior = _baseline_profiles.get(session_id, {})
+        prior_avg = float(prior.get("avg_lie", avg))
+        delta = round(avg - prior_avg, 2)
+        baseline_note = {
+            "prior_avg_lie": round(prior_avg, 2),
+            "current_avg_lie": round(avg, 2),
+            "delta": delta,
+        }
+        _baseline_profiles[session_id] = {
+            "avg_lie": round(avg, 2),
+            "updated_at": time.time(),
+            "sessions": int(prior.get("sessions", 0)) + 1,
+        }
+        _save_baselines()
+
     report = {
         'total': len(history),
         'avg': round(avg, 1),
@@ -442,14 +768,14 @@ def _generate_final_report():
         'history': [
             {'q': h['question'][:80], 'score': h['score'].get('lie_probability', 0),
              'verdict': h['score'].get('verdict', '')} for h in history
-        ]
+        ],
+        'baseline': baseline_note,
+        'evidence_tip': _evidence_chain_tip[:24] if _feature_enabled("evidence_chain") else None,
+        'timeline_tail': _timeline[-20:] if _feature_enabled("replay_timeline") else [],
+        'addons': _feature_matrix(),
     }
     with _state_lock:
         _state['final_report'] = report
-
-    if FACE_AVAILABLE and _face:
-        try: _face.stop()
-        except Exception: pass
 
     socketio.emit('final_report', report)
 
