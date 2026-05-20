@@ -711,6 +711,33 @@ def on_next_question(data):
 def on_end_session(data):
     _generate_final_report()
 
+@socketio.on('reset_session')
+def on_reset_session(data=None):
+    global USED_QUESTIONS
+    USED_QUESTIONS.clear()
+    _fusion_window.clear()
+    new_id = f"PTH-{random.randint(10000,99999)}"
+    with _state_lock:
+        _state['phase'] = 'menu'
+        _state['mode'] = 0
+        _state['questions_asked'] = 0
+        _state['scores'] = []
+        _state['session_history'] = []
+        _state['avg_lie'] = 0
+        _state['deceptive_count'] = 0
+        _state['truthful_count'] = 0
+        _state['inconclusive_count'] = 0
+        _state['final_report'] = None
+        _state['last_score'] = None
+        _state['last_score_full'] = None
+        _state['last_flags'] = []
+        _state['last_ai_note'] = ''
+        _state['last_technique'] = ''
+        _state['contradiction_alert'] = None
+        _state['session_id'] = new_id
+        _state['uptime_start'] = time.time()
+    emit('session_reset', {'session_id': new_id})
+
 def _generate_final_report():
     with _state_lock:
         _state['phase'] = 'report'

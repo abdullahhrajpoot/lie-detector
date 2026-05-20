@@ -331,7 +331,7 @@
                     <div style="font-size: 12px; font-weight: bold; margin-bottom: 5px;" class="cyan">◈ AI FORENSIC PROFILE</div>
                     <div id="rep-profile" style="font-size: 13px; line-height: 1.4; padding: 10px; border: 1px dashed #333; flex-grow:1; overflow-y:auto; margin-bottom: 10px;"></div>
                     
-                    <button class="submit-btn" style="color:#00FF41; border-color:#00FF41; text-shadow: none;" onclick="location.reload()">[ NEW INTAKE ▶ ]</button>
+                    <button class="submit-btn" style="color:#00FF41; border-color:#00FF41; text-shadow: none;" onclick="newIntake()">[ NEW INTAKE ▶ ]</button>
                 </div>
 
             </div>
@@ -414,6 +414,7 @@
 
         let featureMatrix = [];
         let canStartSession = false;
+        let sessionActive = false;
         function statusClass(status) {
             if (status === 'READY' || status === 'OFF') return 'feature-status-ready';
             if (status === 'UNAVAILABLE') return 'feature-status-bad';
@@ -729,8 +730,10 @@
             els.qAsked.innerText = data.questions_asked;
             els.avgLie.innerText = data.avg_lie.toFixed(1) + '%';
             
-            // Phase sync
-            if(data.phase && data.phase !== 'menu' && !document.getElementById('phase-'+data.phase).classList.contains('active')){
+            // Phase sync — only for active mid-session states; result/report have dedicated events
+            const midSessionPhases = ['question', 'analyzing'];
+            if(data.phase && midSessionPhases.includes(data.phase) && sessionActive &&
+               !document.getElementById('phase-'+data.phase).classList.contains('active')){
                 setPhase(data.phase);
             }
 
@@ -809,6 +812,7 @@
         }
 
         socket.on('new_question', data => {
+            sessionActive = true;
             document.getElementById('q-text').innerText = `[Query ${data.number}]\n${data.question}`;
             document.getElementById('answer-input').value = '';
             document.getElementById('answer-warn').innerText = '';
@@ -923,7 +927,30 @@
         function nextQuestion() { socket.emit('next_question', {}); }
         function endSession() { socket.emit('end_session', {}); }
 
+        function newIntake() {
+            sessionActive = false;
+            socket.emit('reset_session', {});
+            // Reset all result/report UI to defaults
+            document.getElementById('answer-input').value = '';
+            document.getElementById('answer-warn').innerText = '';
+            document.getElementById('word-count').innerText = 'WORDS: 0';
+            document.getElementById('submit-btn').classList.add('disabled');
+            document.getElementById('q-asked').innerText = '0';
+            document.getElementById('avg-lie').innerText = '0.0%';
+            document.getElementById('ai-logs').innerHTML = '';
+            document.getElementById('res-flags').innerHTML = '';
+            document.getElementById('res-ai-note').innerText = '';
+            document.getElementById('rep-profile').innerText = '';
+            setPhase('menu');
+        }
+
+        socket.on('session_reset', data => {
+            if (data && data.session_id) els.sessId.innerText = data.session_id;
+            setPhase('menu');
+        });
+
         socket.on('final_report', data => {
+            sessionActive = false;
             setPhase('report');
             
             const ov = document.getElementById('rep-overall');
