@@ -5,9 +5,6 @@ Project: lie-detector (POLYTRUTH Behavioral Interrogation System)
 Stack: Python (CLI + Flask/Socket.IO web GUI), optional Gemini AI, OpenCV, sounddevice
 Last updated: 2026-05-21
 
-Canonical coding rules: POLYTRUTH_MASTER_DIRECTIVE.md + .cursor/rules/polytruth-v5-master-directive.mdc
-All numeric thresholds: scoring.py (single source of truth).
-
 This document explains how the system works end-to-end, all four modes, where the
 "dataset" comes from, how scores are calculated (without grey/inconclusive bands),
 how thresholds relate to published deception research, and how this project compares

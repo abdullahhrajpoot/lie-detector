@@ -1,0 +1,40 @@
+---
+description: POLYTRUTH v5.0 master coding directive — architecture, scoring, peripherals, research honesty
+alwaysApply: true
+---
+
+# POLYTRUTH v5.0 — Master Coding Directive
+
+Before editing any file, read:
+- `POLYTRUTH_MASTER_DIRECTIVE.md` (full NUKE PROMPT)
+- `documentation_and_working.txt` (architecture + dataset + research comparison)
+
+## Non-negotiables
+
+1. **Pipeline order** (never break): question → capture → `AnalysisResult` → voice (if armed) → face (if armed) → contradiction → AI delta → `LieScorer.score_multimodal()` → history → branch/report.
+
+2. **Binary verdict only**: `lie_probability <= 50` → TRUTHFUL; `> 50` → DECEPTIVE. No INCONCLUSIVE. Session: CLEARED vs FLAGGED only.
+
+3. **All thresholds live in `scoring.py`** only. Voice/face modules import constants from `scoring.py` — never duplicate `0.4`, `0.15`, `8`, `25`, etc.
+
+4. **Peripherals**: score only when feature ENABLED **and** ARMED **and** hardware available. ARM/DISARM must call `FaceTracker.start/stop` and `VoiceAnalyzer.start_recording/stop_monitoring`.
+
+5. **Cosmetic GUI biomarkers** (HR, RR, SC, cortisol, pupil, etc.) are **never** inputs to `LieScorer`.
+
+6. **Web typing**: browser sends `typing_metrics` with `first_key_delay_ms`, `inter_key_intervals`, etc. → `analyzer.analysis_from_web_metrics()`. **No random metrics.**
+
+7. **AI**: additive delta only, clamped `[-15, +35]` via `LieScorer.clamp_ai_delta()`. On failure → delta `0`, `technique_tag: rule_only`.
+
+8. **Honesty**: never claim validated accuracy, clinical certification, or polygraph equivalence in code/comments.
+
+## File roles
+
+- `scoring.py` — sole scorer + constants
+- `analyzer.py` — keystroke / web metrics only
+- `gui.py` — Socket.IO + state + arm/disarm; **no scoring logic**
+- `questions.py` — static lists only (hand-authored dataset)
+- `voice_analyzer.py` / `face_tracker.py` — sensor caps enforced in-module
+
+## Minimum answer
+
+`MIN_ANSWER_WORDS = 15` from `scoring.py` — reject before scoring, do not score short answers.

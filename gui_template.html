@@ -294,7 +294,7 @@
                 <div id="phase-result" class="phase-content">
                     <div class="verdict-box" id="res-verdict-box">
                         <div class="verdict-icon glow" id="res-icon">?</div>
-                        <div style="font-size: 24px; font-weight: bold;" id="res-verdict-text" class="glow">INCONCLUSIVE</div>
+                        <div style="font-size: 24px; font-weight: bold;" id="res-verdict-text" class="glow">PENDING</div>
                     </div>
                     
                     <div style="display:flex; justify-content: space-between; margin-bottom: 5px;" class="cyan">
@@ -825,27 +825,27 @@
             const txt = document.getElementById('answer-input').value.trim();
             const words = txt ? txt.split(/\s+/).length : 0;
             const end = Date.now();
-            const cognitive_delay = firstKeyAt
-                ? (firstKeyAt - questionShownAt) / 1000
-                : (end - questionShownAt) / 1000;
-            const duration = firstKeyAt ? (end - firstKeyAt) / 1000 : cognitive_delay;
-            let burst_volatility = 0;
+            const first_key_delay_ms = firstKeyAt
+                ? (firstKeyAt - questionShownAt)
+                : (end - questionShownAt);
+            const total_time_ms = firstKeyAt ? (end - firstKeyAt) : first_key_delay_ms;
+            const inter_key_intervals = [];
             if (keyTimestamps.length >= 2) {
-                const gaps = [];
                 for (let i = 1; i < keyTimestamps.length; i++) {
-                    gaps.push((keyTimestamps[i] - keyTimestamps[i - 1]) / 1000);
+                    inter_key_intervals.push(
+                        (keyTimestamps[i] - keyTimestamps[i - 1]) / 1000
+                    );
                 }
-                const mean = gaps.reduce((a, b) => a + b, 0) / gaps.length;
-                const variance = gaps.reduce((s, g) => s + (g - mean) ** 2, 0) / gaps.length;
-                burst_volatility = Math.sqrt(variance);
             }
-            const wpm = duration > 0 && words > 0 ? (words / (duration / 60)) : 0;
+            const durationSec = total_time_ms / 1000;
+            const wpm = durationSec > 0 && words > 0 ? (words / (durationSec / 60)) : 0;
             return {
-                cognitive_delay: Math.round(cognitive_delay * 1000) / 1000,
-                duration: Math.round(Math.max(0.5, duration) * 1000) / 1000,
+                total_time_ms: Math.round(total_time_ms),
+                word_count: words,
                 wpm: Math.round(wpm * 10) / 10,
-                burst_volatility: Math.round(burst_volatility * 10000) / 10000,
                 backspace_count: backspaceCount,
+                inter_key_intervals,
+                first_key_delay_ms: Math.round(first_key_delay_ms),
             };
         }
 

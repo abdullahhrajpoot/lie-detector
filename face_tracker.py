@@ -1,8 +1,24 @@
+"""
+face_tracker.py — POLYTRUTH v5.0
+OpenCV Haar face presence + movement variance heuristics.
+
+LIMITATION (DePaulo et al. 2003): gaze aversion is a weak/unreliable deception cue.
+This module does NOT use pupilometry or trained fixation classifiers.
+"Sustained eye contact" is never treated as a truthfulness signal.
+"""
+
 import threading
 import time
 import base64
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import numpy as np
+
+from scoring import (
+    FACE_LOOK_AWAY_HIGH,
+    FACE_LOOK_AWAY_MED,
+    FACE_POSITION_VAR_THRESHOLD,
+    FACE_STRESS_CAP,
+)
 
 FACE_AVAILABLE = False
 try:
@@ -29,8 +45,38 @@ def FaceStats_empty():
         look_away_count=0,
         face_position_variance=0.0,
         face_score=0,
-        face_flags=["VISUAL SENSOR OFFLINE"]
+        face_flags=[],
     )
+
+
+def FaceStats_disarmed():
+    return FaceStats_empty()
+
+
+def compute_face_stress(
+    look_away_count: int,
+    position_variance: float,
+    face_detected: bool,
+) -> tuple[int, list]:
+    score = 0
+    flags = []
+
+    if look_away_count > FACE_LOOK_AWAY_HIGH:
+        score += 15
+        flags.append("REPEATED VISUAL FIELD AVOIDANCE")
+    elif look_away_count > FACE_LOOK_AWAY_MED:
+        score += 8
+        flags.append("GAZE AVERSION DETECTED")
+
+    if position_variance > FACE_POSITION_VAR_THRESHOLD:
+        score += 10
+        flags.append("HIGH MICRO-MOVEMENT — POSTURAL ANXIETY")
+
+    if not face_detected:
+        score += 5
+        flags.append("FACE OBSCURED AT ANALYSIS POINT")
+
+    return min(FACE_STRESS_CAP, score), flags
 
 class FaceTracker:
     def __init__(self):
@@ -138,10 +184,10 @@ class FaceTracker:
             self.latest_frame = None
             self.last_face_box = None
 
-    def get_current_stats(self) -> FaceStats:
-        if not FACE_AVAILABLE:
-            return FaceStats_empty()
-            
+    def get_current_stats(self, armed: bool = True) -> FaceStats:
+        if not FACE_AVAILABLE or not armed:
+            return FaceStats_disarmed()
+
         with self.lock:
             if len(self.position_history) > 1:
                 pts = np.array(self.position_history)
@@ -150,31 +196,17 @@ class FaceTracker:
             else:
                 var = 0.0
             
-            score = 0
-            flags = []
-            
-            if self.look_away_count > 3:
-                score += 15
-                flags.append("REPEATED VISUAL FIELD AVOIDANCE")
-            elif self.look_away_count > 1:
-                score += 8
-                flags.append("GAZE AVERSION DETECTED")
-                
-            if var > 0.08:
-                score += 10
-                flags.append("HIGH MICRO-MOVEMENT \u2014 POSTURAL ANXIETY")
-                
-            if not self.face_detected:
-                score += 5
-                flags.append("FACE OBSCURED AT ANALYSIS POINT")
-                
+            score, flags = compute_face_stress(
+                self.look_away_count, var, self.face_detected
+            )
+
             stats = FaceStats(
                 face_detected=self.face_detected,
                 face_confidence=self.face_confidence,
                 gaze_stability=self.gaze_stability,
                 look_away_count=self.look_away_count,
                 face_position_variance=var,
-                face_score=min(25, score),
+                face_score=score,
                 face_flags=flags
             )
             

@@ -20,18 +20,20 @@ except ImportError:
 
 # Import existing backend modules with graceful fallback
 try:
-    from analyzer import AnalysisResult, SessionAbortException
+    from analyzer import AnalysisResult, SessionAbortException, analysis_from_web_metrics
     ANALYZER_OK = True
 except Exception as e:
     ANALYZER_OK = False
+    analysis_from_web_metrics = None
 
 try:
-    from scoring import LieScorer, VERDICT_THRESHOLD, BASE_SCORE
+    from scoring import LieScorer, VERDICT_THRESHOLD, BASE_SCORE, MIN_ANSWER_WORDS
     SCORER_OK = True
 except Exception:
     SCORER_OK = False
     VERDICT_THRESHOLD = 50
     BASE_SCORE = 15
+    MIN_ANSWER_WORDS = 15
 
 try:
     from ai_analyst import AIAnalyst, AI_AVAILABLE
@@ -356,56 +358,49 @@ def _sensor_loop():
                 pass
         time.sleep(0.1)
 
-def _analysis_from_typing_metrics(answer_text: str, metrics: dict) -> AnalysisResult:
-    """Build AnalysisResult from browser-captured keystroke timing (no random values)."""
-    words = answer_text.split()
-    word_count = len(words)
-    cognitive_delay = float(metrics.get('cognitive_delay', 0) or 0)
-    duration = float(metrics.get('duration', 0) or 0)
-    wpm = float(metrics.get('wpm', 0) or 0)
-    burst_volatility = float(metrics.get('burst_volatility', 0) or 0)
-    backspace_count = int(metrics.get('backspace_count', 0) or 0)
-
-    if cognitive_delay <= 0 and duration > 0:
-        cognitive_delay = min(30.0, max(0.5, duration * 0.15))
-    if duration <= 0 and word_count > 0:
-        duration = max(1.0, word_count * 0.45)
-    if wpm <= 0 and duration > 0 and word_count > 0:
-        wpm = round(word_count / (duration / 60.0), 1)
-    if burst_volatility <= 0 and word_count > 1:
-        burst_volatility = 0.35
-
-    return AnalysisResult(
-        answer=answer_text,
-        word_count=word_count,
-        cognitive_delay=round(max(0.0, cognitive_delay), 3),
-        wpm=round(max(0.0, min(200.0, wpm)), 1),
-        burst_volatility=round(max(0.0, burst_volatility), 4),
-        backspace_count=backspace_count,
-        duration=round(max(0.5, duration), 3),
-    )
-
 # \u2500\u2500 Answer processing (runs in background thread) \u2500\u2500\u2500\u2500\u2500
 def _process_answer(answer_text, question_text, typing_metrics=None):
     with _state_lock:
         _state['phase'] = 'analyzing'
 
     try:
-        result = _analysis_from_typing_metrics(answer_text, typing_metrics or {})
+        if ANALYZER_OK and analysis_from_web_metrics:
+            result = analysis_from_web_metrics(answer_text, typing_metrics or {})
+        else:
+            result = AnalysisResult(
+                answer=answer_text,
+                word_count=len(answer_text.split()),
+                cognitive_delay=0,
+                wpm=0,
+                burst_volatility=0,
+                backspace_count=0,
+                duration=1.0,
+            )
 
-        # Voice
-        if _feature_enabled("microphone_sensor") and _feature_armed("microphone_sensor") and VOICE_AVAILABLE and _voice:
+        mic_armed = (
+            _feature_enabled("microphone_sensor")
+            and _feature_armed("microphone_sensor")
+            and VOICE_AVAILABLE
+            and _voice
+        )
+        cam_armed = (
+            _feature_enabled("camera_feed")
+            and _feature_armed("camera_feed")
+            and FACE_AVAILABLE
+            and _face
+        )
+
+        if mic_armed:
             try:
-                voice_result = _voice.stop_recording()
+                voice_result = _voice.stop_recording(armed=True)
             except Exception:
                 voice_result = _get_empty_voice()
         else:
             voice_result = _get_empty_voice()
 
-        # Face
-        if _feature_enabled("camera_feed") and _feature_armed("camera_feed") and FACE_AVAILABLE and _face:
+        if cam_armed:
             try:
-                face_stats = _face.get_current_stats()
+                face_stats = _face.get_current_stats(armed=True)
             except Exception:
                 face_stats = _get_empty_face()
         else:
@@ -491,10 +486,11 @@ def _process_answer(answer_text, question_text, typing_metrics=None):
             _state['scores'].append(score['lie_probability'])
             _state['avg_lie'] = sum(_state['scores']) / len(_state['scores'])
             _state['questions_asked'] += 1
-            v = score.get('verdict', 'INCONCLUSIVE')
-            if v == 'DECEPTIVE':   _state['deceptive_count'] += 1
-            elif v == 'TRUTHFUL':  _state['truthful_count'] += 1
-            else:                  _state['inconclusive_count'] += 1
+            v = score.get('verdict', 'TRUTHFUL')
+            if v == 'DECEPTIVE':
+                _state['deceptive_count'] += 1
+            else:
+                _state['truthful_count'] += 1
             _state['last_score'] = score['lie_probability']
             _state['last_flags'] = score.get('flags', [])[:8]
             _state['last_ai_note'] = score.get('ai_profile_note', '')
@@ -505,7 +501,12 @@ def _process_answer(answer_text, question_text, typing_metrics=None):
             _state['session_history'].append({
                 'question': question_text,
                 'answer': stored_answer,
-                'score': score
+                'lie_probability': score['lie_probability'],
+                'verdict': score.get('verdict', 'TRUTHFUL'),
+                'flags': score.get('flags', [])[:8],
+                'confidence': score.get('confidence', 'LOW'),
+                'timestamp': time.time(),
+                'score': score,
             })
             if contradiction and hasattr(contradiction, 'detected') and contradiction.detected:
                 _state['contradiction_alert'] = {
@@ -525,7 +526,7 @@ def _process_answer(answer_text, question_text, typing_metrics=None):
 
         socketio.emit('answer_scored', {
             'lie_probability': score['lie_probability'],
-            'verdict': score.get('verdict', 'INCONCLUSIVE'),
+            'verdict': score.get('verdict', 'TRUTHFUL'),
             'confidence': score.get('confidence', 'LOW'),
             'flags': score.get('flags', [])[:8],
             'ai_note': score.get('ai_profile_note', ''),
@@ -722,8 +723,10 @@ def on_start_session(data):
 def on_submit_answer(data):
     answer = data.get('answer', '').strip()
     question = data.get('question', '')
-    if len(answer.split()) < 15:
-        emit('answer_rejected', {'reason': 'MINIMUM 15 WORDS REQUIRED. SYSTEM DEMANDS FULL NARRATIVE.'})
+    if len(answer.split()) < MIN_ANSWER_WORDS:
+        emit('answer_rejected', {
+            'reason': f'MINIMUM {MIN_ANSWER_WORDS} WORDS REQUIRED. SYSTEM DEMANDS FULL NARRATIVE.'
+        })
         return
     if _feature_enabled("microphone_sensor") and _feature_armed("microphone_sensor") and VOICE_AVAILABLE and _voice:
         try: _voice.start_recording()

@@ -2,13 +2,14 @@
 analyzer.py — POLYTRUTH v5.0
 Real-time keystroke capture and behavioral analysis.
 Falls back to plain input() if keyboard hooks are unavailable.
+
+Web GUI sends typing_metrics JSON (deterministic — no random noise).
 """
 
 import time
 import math
-import random
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 
@@ -182,6 +183,56 @@ class KeystrokeAnalyzer:
 # ─────────────────────────────────────────────────────────────
 # Public function
 # ─────────────────────────────────────────────────────────────
+def analysis_from_web_metrics(answer: str, metrics: dict) -> AnalysisResult:
+    """
+    Build AnalysisResult from browser typing_metrics (NUKE PROMPT schema).
+    Fields: total_time_ms, word_count, wpm, backspace_count,
+            inter_key_intervals (seconds), first_key_delay_ms
+    """
+    import math as _math
+
+    words = answer.split()
+    word_count = int(metrics.get("word_count") or len(words))
+
+    first_delay_ms = float(metrics.get("first_key_delay_ms") or 0)
+    cognitive_delay = first_delay_ms / 1000.0 if first_delay_ms > 0 else 0.0
+
+    total_time_ms = float(metrics.get("total_time_ms") or 0)
+    duration = total_time_ms / 1000.0 if total_time_ms > 0 else 0.0
+
+    wpm = float(metrics.get("wpm") or 0)
+    backspace_count = int(metrics.get("backspace_count") or 0)
+
+    intervals = metrics.get("inter_key_intervals") or []
+    burst_volatility = 0.0
+    if isinstance(intervals, list) and len(intervals) >= 2:
+        gaps = [float(g) for g in intervals]
+        mean_gap = sum(gaps) / len(gaps)
+        variance = sum((g - mean_gap) ** 2 for g in gaps) / len(gaps)
+        burst_volatility = _math.sqrt(variance)
+    elif float(metrics.get("burst_volatility") or 0) > 0:
+        burst_volatility = float(metrics["burst_volatility"])
+
+    if cognitive_delay <= 0 and duration > 0:
+        cognitive_delay = min(30.0, max(0.5, duration * 0.15))
+    if duration <= 0 and word_count > 0 and wpm > 0:
+        duration = max(1.0, word_count / (wpm / 60.0))
+    elif duration <= 0 and word_count > 0:
+        duration = max(1.0, word_count * 0.45)
+    if wpm <= 0 and duration > 0 and word_count > 0:
+        wpm = word_count / (duration / 60.0)
+
+    return AnalysisResult(
+        answer=answer,
+        word_count=word_count,
+        cognitive_delay=round(max(0.0, cognitive_delay), 3),
+        wpm=round(max(0.0, min(200.0, wpm)), 1),
+        burst_volatility=round(max(0.0, burst_volatility), 4),
+        backspace_count=backspace_count,
+        duration=round(max(0.5, duration), 3),
+    )
+
+
 def analyze_answer(question_display_time: float) -> AnalysisResult:
     """
     Block, collect the full answer, and return an AnalysisResult.

@@ -107,15 +107,8 @@ def _build_behavioral_summary(scores: List[dict]) -> str:
     from scoring import VERDICT_THRESHOLD
     if avg > VERDICT_THRESHOLD:
         profile = (
-            f"Subject demonstrated elevated deception indicators throughout the session. "
-            f"Average lie probability: {avg:.0f}%. "
-            f"{dec_count} of {len(scores)} responses were classified DECEPTIVE.{flag_summary}"
-        )
-    elif avg > 50:
-        profile = (
-            f"Subject exceeded deception threshold. "
-            f"Average lie probability: {avg:.0f}%. "
-            f"Classified DECEPTIVE on aggregate.{flag_summary}"
+            f"Subject exceeded deception threshold (avg {avg:.0f}%). "
+            f"{dec_count} of {len(scores)} responses classified DECEPTIVE.{flag_summary}"
         )
     else:
         profile = (
@@ -137,7 +130,7 @@ def _build_report(scores: List[dict], mode_label: str = "") -> dict:
             "inconclusive_count": 0,
             "most_suspicious_answer": None,
             "behavioral_summary": "No data.",
-            "overall_verdict": "ANALYSIS INCONCLUSIVE",
+            "overall_verdict": "SUBJECT CLEARED",
             "timeline": []
         }
 
@@ -145,8 +138,6 @@ def _build_report(scores: List[dict], mode_label: str = "") -> dict:
     max_score = max(scores, key=lambda s: s["lie_probability"])
     dec = sum(1 for s in scores if s["verdict"] == "DECEPTIVE")
     tru = sum(1 for s in scores if s["verdict"] == "TRUTHFUL")
-    inc = sum(1 for s in scores if s["verdict"] == "INCONCLUSIVE")
-
     from scoring import VERDICT_THRESHOLD
     if avg > VERDICT_THRESHOLD or dec > 0:
         overall = "SUBJECT FLAGGED"
@@ -167,7 +158,7 @@ def _build_report(scores: List[dict], mode_label: str = "") -> dict:
         "max_lie_probability": max_score["lie_probability"],
         "deceptive_count": dec,
         "truthful_count": tru,
-        "inconclusive_count": inc,
+        "inconclusive_count": 0,
         "most_suspicious_answer": {"question": max_score.get("question", ""), "score": max_score},
         "behavioral_summary": ai_profile,
         "overall_verdict": overall,
@@ -357,13 +348,13 @@ class Session:
         scores_list.append(score["lie_probability"])
         ui.update_session_state("scores", scores_list)
 
-        verdicts = {
-            "DECEPTIVE": "deceptive_count",
-            "TRUTHFUL": "truthful_count",
-            "INCONCLUSIVE": "inconclusive_count",
-        }
-        key = verdicts.get(score["verdict"])
-        if key:
+        if score["verdict"] == "DECEPTIVE":
             ui.update_session_state(
-                key, ui._session_state.get(key, 0) + 1
+                "deceptive_count",
+                ui._session_state.get("deceptive_count", 0) + 1,
+            )
+        else:
+            ui.update_session_state(
+                "truthful_count",
+                ui._session_state.get("truthful_count", 0) + 1,
             )
