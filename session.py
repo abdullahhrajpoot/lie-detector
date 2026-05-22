@@ -10,7 +10,7 @@ from typing import List, Optional
 import ui
 from analyzer import analyze_answer, SessionAbortException, AnalysisResult
 from questions import QUESTION_BANK, FOLLOWUP_DECEPTIVE, FOLLOWUP_TRUTHFUL, USED_QUESTIONS
-from scoring import LieScorer
+from scoring import LieScorer, is_gibberish_answer
 
 from ai_analyst import AIAnalyst, AI_AVAILABLE
 from voice_analyzer import VoiceAnalyzer, VOICE_AVAILABLE, VoiceResult_empty
@@ -49,6 +49,20 @@ def _run_single_question(question: str, scorer: LieScorer) -> dict:
         if VOICE_AVAILABLE:
             _voice.stop_recording()
         raise
+
+    if is_gibberish_answer(result.answer):
+        if VOICE_AVAILABLE:
+            _voice.stop_recording()
+        ui.show_analysis_progress("VALIDATING RESPONSE INTEGRITY...")
+        time.sleep(0.4)
+        ui.stop_dashboard()
+        from rich.console import Console
+        Console().print(
+            "\n  [bold red]INPUT FLAGGED:[/] Gibberish / non-narrative text detected. "
+            "Re-answer with a coherent 15+ word response.\n"
+        )
+        ui.start_dashboard(ui._session_state)
+        return _run_single_question(question, scorer)
     
     voice_result = _voice.stop_recording() if VOICE_AVAILABLE else VoiceResult_empty()
     face_stats = _face.get_current_stats() if FACE_AVAILABLE else FaceStats_empty()

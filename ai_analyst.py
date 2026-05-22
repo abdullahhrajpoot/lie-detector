@@ -11,11 +11,20 @@ import json
 
 from scoring import AI_DELTA_MIN, AI_DELTA_MAX, LieScorer
 
+def _gemini_api_key() -> str:
+    return (
+        os.environ.get("GOOGLE_GEMINI_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+        or ""
+    ).strip()
+
+
 AI_AVAILABLE = False
 try:
     import google.generativeai as genai
-    if os.environ.get("GEMINI_API_KEY"):
-        genai.configure(api_key=os.environ.get("GEMINI_API_KEY"))
+    _api_key = _gemini_api_key()
+    if _api_key:
+        genai.configure(api_key=_api_key)
         AI_AVAILABLE = True
 except ImportError:
     pass

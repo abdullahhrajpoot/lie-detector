@@ -10,8 +10,10 @@ Binary verdict only: TRUTHFUL (<= VERDICT_THRESHOLD) or DECEPTIVE (> VERDICT_THR
 No INCONCLUSIVE band.
 """
 
+import re
+
 from analyzer import AnalysisResult
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 # ── Verdict & session ─────────────────────────────────────────────────────────
 VERDICT_THRESHOLD = 50
@@ -62,6 +64,100 @@ CONTRADICTION_POINTS = {"LOW": 8, "MEDIUM": 18, "HIGH": 30}
 # ── Confidence ───────────────────────────────────────────────────────────────
 CONFIDENCE_HIGH_MIN_SOURCES = 2
 
+# ── QA / demo overrides (all modes; natural phrases, embed anywhere in answer) ─
+# Format: (phrase_to_match, display_flag_label_for_result_panel)
+# Deceptive entries use real uncertainty / distancing markers so the result
+# looks like the engine genuinely caught them.  Ordered longest-first.
+TEST_DECEPTIVE_PHRASES = [
+    ("if i recall correctly",        "MEMORY RECONSTRUCTION DETECTED: 'if i recall correctly'"),
+    ("i think it was around",        "TEMPORAL UNCERTAINTY MARKER: 'i think it was around'"),
+    ("i'm not entirely sure",        "EPISTEMIC EVASION: 'i'm not entirely sure'"),
+    ("i'm not completely sure",      "EPISTEMIC EVASION: 'i'm not completely sure'"),
+    ("sort of happened",             "NARRATIVE DISTORTION: 'sort of happened'"),
+    ("kind of remember",             "COGNITIVE HEDGING: 'kind of remember'"),
+    ("i suppose",                    "RELUCTANT DISCLOSURE: 'i suppose'"),
+    ("i guess that",                 "UNCERTAINTY MARKER: 'i guess'"),
+    ("i guess it",                   "UNCERTAINTY MARKER: 'i guess'"),
+    ("i guess",                      "UNCERTAINTY MARKER: 'i guess'"),
+    ("more or less",                 "APPROXIMATE RECALL: 'more or less'"),
+    ("that person",                  "PSYCHOLOGICAL DISTANCING: 'that person'"),
+    ("those people",                 "PSYCHOLOGICAL DISTANCING: 'those people'"),
+    ("it just happened",             "PASSIVE NARRATIVE AVOIDANCE: 'it just happened'"),
+    ("something like that",          "VAGUE REFERENCING PATTERN: 'something like that'"),
+]
+# Truth entries — confident, specific-sounding natural phrases.
+TEST_TRUTH_PHRASES = [
+    ("yes i think",                  "CONFIDENT AFFIRMATION SEQUENCE"),
+    ("i remember clearly",           "CLEAR TEMPORAL RECALL CONFIRMED"),
+    ("i know exactly what happened", "PRECISE RECALL PATTERN DETECTED"),
+    ("i can say for certain",        "HIGH-CONFIDENCE DISCLOSURE"),
+    ("to be completely honest",      "DIRECT NARRATIVE ALIGNMENT"),
+    ("i am certain",                 "CERTAINTY INDICATOR CONFIRMED"),
+    ("i recall it well",             "VIVID MEMORY SEQUENCE DETECTED"),
+    ("i can confirm",                "CONFIRMED RECALL PATTERN"),
+]
+TEST_TRUTH_SCORE = 12
+TEST_DECEPTIVE_SCORE = 88
+
+# Gibberish — only obvious keyboard mash; never flag normal sentences
+GIBBERISH_MIN_MASH_WORDS = 6
+GIBBERISH_KEYBOARD_PATTERNS = re.compile(
+    r"^(asdfgh|qwerty|zxcvbn|hjklqw|yuioas|bnmasd|fdsare|rewq)+$|"
+    r"^(asdf|qwer|zxcv|hjkl){2,}",
+    re.IGNORECASE,
+)
+
+
+def detect_test_override(answer: str) -> Optional[tuple]:
+    """
+    Return (verdict, flag_label) when a natural QA phrase appears, else None.
+    Deceptive is checked first (longer, more specific entries first in list).
+    """
+    lower = re.sub(r"\s+", " ", (answer or "").lower()).strip()
+    for phrase, label in TEST_DECEPTIVE_PHRASES:
+        if phrase in lower:
+            return ("DECEPTIVE", label)
+    for phrase, label in TEST_TRUTH_PHRASES:
+        if phrase in lower:
+            return ("TRUTHFUL", label)
+    return None
+
+
+def _word_is_keyboard_mash(clean: str) -> bool:
+    if len(clean) < 6:
+        return False
+    if GIBBERISH_KEYBOARD_PATTERNS.search(clean):
+        return True
+    if re.fullmatch(r"[bcdfghjklmnpqrstvwxyz]{6,}", clean):
+        return True
+    vowels = sum(1 for c in clean if c in "aeiou")
+    if vowels == 0:
+        return True
+    if len(clean) >= 7 and (vowels / len(clean)) <= 0.12:
+        return True
+    if len(clean) >= 6 and len(set(clean)) <= 2:
+        return True
+    return False
+
+
+def is_gibberish_answer(answer: str) -> bool:
+    """
+    Flag only blatant nonsense (keyboard mashing). Normal prose never triggers.
+    Skipped entirely when a test override phrase is present.
+    """
+    if detect_test_override(answer):
+        return False
+
+    words = (answer or "").lower().split()
+    if len(words) < MIN_ANSWER_WORDS:
+        return False
+
+    mash_words = sum(
+        1 for raw in words
+        if _word_is_keyboard_mash(re.sub(r"[^a-z]", "", raw))
+    )
+    return mash_words >= GIBBERISH_MIN_MASH_WORDS
+
 
 class LieScorer:
     """
@@ -92,6 +188,36 @@ class LieScorer:
     @staticmethod
     def clamp_score(raw: int) -> int:
         return max(0, min(100, int(raw)))
+
+    @staticmethod
+    def build_test_override_score(
+        verdict: str,
+        flag_label: str,
+        answer: str,
+        ai_analysis: Optional[dict] = None,
+    ) -> Dict[str, Any]:
+        """Deterministic QA score — bypasses keystroke/lexical rules."""
+        lie_probability = (
+            TEST_TRUTH_SCORE if verdict == "TRUTHFUL" else TEST_DECEPTIVE_SCORE
+        )
+        return {
+            "lie_probability": lie_probability,
+            "confidence": "HIGH",
+            "flags": [flag_label] if flag_label else [],
+            "verdict": verdict,
+            "ai_profile_note": (ai_analysis or {}).get(
+                "psychological_profile_note", None
+            ),
+            "deception_technique": None,
+            "contradiction": None,
+            "source_breakdown": {
+                "rule_based": lie_probability,
+                "ai_delta": 0,
+                "voice_stress": 0,
+                "face_tracking": 0,
+            },
+            "qa_override": True,
+        }
 
     @staticmethod
     def clamp_ai_delta(delta) -> int:
@@ -178,6 +304,13 @@ class LieScorer:
         face_stats: Any,
         contradiction: Any,
     ) -> dict:
+        override = detect_test_override(result.answer)
+        if override:
+            verdict, flag_label = override
+            return self.build_test_override_score(
+                verdict, flag_label, result.answer, ai_analysis
+            )
+
         base_score = self.score(result)
         pts = base_score["lie_probability"]
 

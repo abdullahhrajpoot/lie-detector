@@ -939,6 +939,16 @@
             setTimeout(()=>{ btn.style.animation = ''; }, 400);
         });
 
+        socket.on('answer_flagged', data => {
+            setPhase('question');
+            const warn = document.getElementById('answer-warn');
+            const btn = document.getElementById('submit-btn');
+            warn.innerText = data.reason || 'INPUT FLAGGED — REWRITE YOUR ANSWER.';
+            warn.classList.add('red', 'glow');
+            btn.style.animation = 'errorShake 0.4s';
+            setTimeout(()=>{ btn.style.animation = ''; }, 400);
+        });
+
         socket.on('status_msg', data => {
             document.getElementById('ai-logs').innerHTML += `<div class="amber glow" style="margin-top:10px;">► ${data.msg}</div><br>`;
         });

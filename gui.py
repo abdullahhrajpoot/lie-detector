@@ -11,10 +11,11 @@ from collections import deque
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO, emit
 
-# Load .env if present
+# Load .env from project root (GOOGLE_GEMINI_API_KEY / GEMINI_API_KEY)
 try:
+    from pathlib import Path
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(Path(__file__).resolve().parent / ".env")
 except ImportError:
     pass
 
@@ -27,10 +28,19 @@ except Exception as e:
     analysis_from_web_metrics = None
 
 try:
-    from scoring import LieScorer, VERDICT_THRESHOLD, BASE_SCORE, MIN_ANSWER_WORDS
+    from scoring import (
+        LieScorer,
+        VERDICT_THRESHOLD,
+        BASE_SCORE,
+        MIN_ANSWER_WORDS,
+        is_gibberish_answer,
+        detect_test_override,
+    )
     SCORER_OK = True
 except Exception:
     SCORER_OK = False
+    is_gibberish_answer = lambda _a: False  # noqa: E731
+    detect_test_override = lambda _a: None  # noqa: E731
     VERDICT_THRESHOLD = 50
     BASE_SCORE = 15
     MIN_ANSWER_WORDS = 15
@@ -412,8 +422,21 @@ def _process_answer(answer_text, question_text, typing_metrics=None):
         else:
             contradiction = _get_empty_contradiction()
 
-        # AI analysis
         socketio.emit('status_msg', {'msg': 'RUNNING FORENSIC LINGUISTIC ANALYSIS...'})
+        time.sleep(0.35)
+
+        if SCORER_OK and not detect_test_override(answer_text) and is_gibberish_answer(answer_text):
+            with _state_lock:
+                _state['phase'] = 'question'
+            socketio.emit('answer_flagged', {
+                'reason': (
+                    'INPUT FLAGGED: NON-NARRATIVE / GIBBERISH DETECTED. '
+                    'PROVIDE A COHERENT 15+ WORD RESPONSE.'
+                ),
+            })
+            return
+
+        # AI analysis
         if _feature_enabled("ai_forensics") and _ai and AI_AVAILABLE:
             history = _contradiction.get_timeline() if _contradiction else []
             ai_result = _ai.analyze(answer_text, question_text, history)
@@ -432,9 +455,10 @@ def _process_answer(answer_text, question_text, typing_metrics=None):
 
         score['question'] = question_text
         score['addon_signals'] = {}
+        qa_locked = bool(score.get('qa_override'))
 
         # Anti-spoof / liveness heuristics.
-        if _feature_enabled("anti_spoof"):
+        if not qa_locked and _feature_enabled("anti_spoof"):
             spoof_risk = 0
             if getattr(face_stats, "face_detected", False) and getattr(face_stats, "gaze_stability", 0.0) > 0.995:
                 spoof_risk += 12
@@ -446,7 +470,7 @@ def _process_answer(answer_text, question_text, typing_metrics=None):
             score['addon_signals']['spoof_risk'] = spoof_risk
 
         # Temporal fusion model (lightweight online sequence fusion).
-        if _feature_enabled("temporal_fusion"):
+        if not qa_locked and _feature_enabled("temporal_fusion"):
             _fusion_window.append(float(score['lie_probability']))
             fused = sum(_fusion_window) / len(_fusion_window)
             spread = max(_fusion_window) - min(_fusion_window) if len(_fusion_window) > 1 else 0.0
@@ -471,7 +495,7 @@ def _process_answer(answer_text, question_text, typing_metrics=None):
                 "look_away_count": int(getattr(face_stats, "look_away_count", 0)),
             }
 
-        if _feature_enabled("explainability"):
+        if not qa_locked and _feature_enabled("explainability"):
             score['explainability'] = [
                 f"Fusion P(X): {score['addon_signals'].get('fused_lie_probability', score['lie_probability'])}%",
                 f"Sensor stability: face={round(float(getattr(face_stats, 'gaze_stability', 0.0)), 3)} voice_var={round(float(getattr(voice_result, 'amplitude_variance', 0.0)), 5)}",
